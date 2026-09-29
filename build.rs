@@ -1,0 +1,10 @@
+fn main() {
+    #[cfg(windows)]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        res.set("ProductName", "ShurMap");
+        res.set("FileDescription", "ShurMap");
+        res.compile().expect("failed to embed icon");
+    }
+}

@@ -378,11 +378,70 @@ fn trash_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
+/// Окошко выбора цвета слоя. Возвращает выбранный номер цвета и занятую окошком область.
+fn color_picker(
+    ctx: &egui::Context,
+    anchor: egui::Pos2,
+    layers: &[layers::Layer],
+    current: usize,
+) -> (Option<usize>, egui::Rect) {
+    let n = layers::palette_len();
+    let mut chosen = None;
+    let dark = egui::Color32::from_rgb(40, 40, 40);
+    let shown = egui::Area::new(egui::Id::new("color_picker"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.small("Цвет слоя");
+                egui::Grid::new("color_grid")
+                    .spacing(egui::vec2(6.0, 6.0))
+                    .show(ui, |ui| {
+                        for idx in 0..n {
+                            let (rect, r) = ui
+                                .allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                            // Текущий цвет этого слоя обведён тёмной рамкой
+                            if idx == layers[current].color % n {
+                                ui.painter().rect_filled(rect.expand(3.0), 5.0, dark);
+                            }
+                            ui.painter()
+                                .rect_filled(rect, 4.0, layers::palette_color(idx));
+
+                            // Цвет уже занят другим слоем: помечаем точкой
+                            let owner = layers.iter().enumerate().find(|(j, l)| {
+                                *j != current && !l.is_borders() && l.color % n == idx
+                            });
+                            let r = if let Some((_, l)) = owner {
+                                ui.painter().circle_filled(rect.center(), 4.5, egui::Color32::WHITE);
+                                ui.painter()
+                                    .circle_stroke(rect.center(), 4.5, egui::Stroke::new(1.0, dark));
+                                r.on_hover_text(format!(
+                                    "Занят слоем «{}». Он получит другой цвет.",
+                                    l.name()
+                                ))
+                            } else {
+                                r
+                            };
+                            if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                chosen = Some(idx);
+                            }
+                            if idx % 5 == 4 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        });
+    (chosen, shown.response.rect)
+}
+
 /// Что произошло в панели слоёв за кадр.
 #[derive(Default)]
 struct PanelResult {
     changed: bool,
     remove: Option<usize>,
+    /// Нажали на кружок цвета: номер слоя и его положение на экране
+    color_click: Option<(usize, egui::Rect)>,
 }
 
 fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut bool) -> PanelResult {
@@ -410,8 +469,17 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut
     for (i, layer) in layers.iter_mut().enumerate() {
         ui.horizontal(|ui| {
             // Цвет слоя
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            let (rect, swatch) =
+                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
             ui.painter().rect_filled(rect, 3.0, layer.display_color());
+            if !layer.is_borders() {
+                let swatch = swatch
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Изменить цвет слоя");
+                if swatch.clicked() {
+                    result.color_click = Some((i, rect));
+                }
+            }
 
             // Кнопка слоя: нажата = слой включён
             let hover = format!(
@@ -485,6 +553,8 @@ struct ViewerApp {
     /// Закреплённая подсказка: объект и место, где по нему нажали
     pinned: Option<(layers::Hit, egui::Pos2)>,
     layers: Vec<layers::Layer>,
+    /// Открытое окошко выбора цвета: номер слоя и положение его кружка
+    color_picker: Option<(usize, egui::Rect)>,
     /// Панель слоёв свёрнута
     layers_collapsed: bool,
     /// Вшитые в exe границы стран (российская версия, только суша); в списке слоёв не видны
@@ -506,6 +576,7 @@ impl ViewerApp {
             press_pos: None,
             pinned: None,
             layers: Vec::new(),
+            color_picker: None,
             layers_collapsed: false,
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
@@ -553,6 +624,10 @@ impl ViewerApp {
     }
 
     fn add_layer(&mut self, path: PathBuf) {
+        // Границы стран вшиты в программу и всегда включены: отдельным слоем их не добавляем
+        if layers::Layer::new(path.clone(), true, 0).is_borders() {
+            return;
+        }
         if let Some(existing) = self.layers.iter_mut().find(|l| l.path == path) {
             // Этот файл уже в списке: просто включаем
             existing.visible = true;
@@ -841,11 +916,43 @@ impl eframe::App for ViewerApp {
 
                     if let Some(i) = panel.remove {
                         self.pinned = None;
+                        self.color_picker = None;
                         self.layers.remove(i);
                         self.save_settings();
                     } else if panel.changed {
                         self.pinned = None;
                         self.save_settings();
+                    }
+
+                    // Окошко выбора цвета
+                    if self.layers_collapsed {
+                        self.color_picker = None;
+                    }
+                    if let Some((i, rect)) = panel.color_click {
+                        self.color_picker = match self.color_picker {
+                            Some((k, _)) if k == i => None,
+                            _ => Some((i, rect)),
+                        };
+                    }
+                    if let Some((i, swatch)) = self.color_picker {
+                        if i >= self.layers.len() {
+                            self.color_picker = None;
+                        } else {
+                            let anchor = swatch.left_bottom() + egui::vec2(0.0, 6.0);
+                            let (chosen, area) = color_picker(ui.ctx(), anchor, &self.layers, i);
+                            if let Some(c) = chosen {
+                                layers::assign_color(&mut self.layers, i, c);
+                                self.color_picker = None;
+                                self.save_settings();
+                            } else if panel.color_click.is_none()
+                                && ui.ctx().input(|s| s.pointer.primary_pressed())
+                            {
+                                let pos = ui.ctx().input(|s| s.pointer.interact_pos());
+                                if pos.is_some_and(|p| !area.contains(p) && !swatch.contains(p)) {
+                                    self.color_picker = None;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -921,6 +1028,8 @@ fn main() {
                 .layers
                 .iter()
                 .map(|e| layers::Layer::new(PathBuf::from(&e.path), e.visible, e.color))
+                // Границы стран вшиты в программу: такой файл как отдельный слой не нужен
+                .filter(|l| !l.is_borders())
                 .collect();
             if let Some(map) = saved.map.map(PathBuf::from).filter(|p| p.is_file()) {
                 app.open(map, cc.egui_ctx.clone());

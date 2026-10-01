@@ -53,8 +53,8 @@ fn decimate(pts: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
 /// Статус есть в файлах Global Energy Monitor; без статуса объект рисуется обычным.
 pub fn faded_for_status(status: &str) -> Option<bool> {
     match status.trim().to_lowercase().as_str() {
-        "" | "operating" => Some(false),
-        "cancelled" | "retired" => None,
+        "" | "operating" | "underground gas storage" => Some(false),
+        "cancelled" | "retired" | "abandoned" => None,
         _ => Some(true),
     }
 }
@@ -64,6 +64,24 @@ pub fn pick_color(used: &[usize], palette_len: usize, total_layers: usize) -> us
     (0..palette_len)
         .find(|i| !used.contains(i))
         .unwrap_or(total_layers % palette_len)
+}
+
+/// Назначает слою `i` цвет `new`. Если этот цвет уже был у другого слоя, тот получает
+/// первый свободный цвет (а если свободных нет — прежний цвет слоя `i`).
+/// `skip[j]` = слой не участвует в раскраске (например, слой границ).
+pub fn recolor(colors: &mut [usize], skip: &[bool], i: usize, new: usize, n: usize) {
+    let old = colors[i] % n;
+    colors[i] = new % n;
+    let conflicts: Vec<usize> = (0..colors.len())
+        .filter(|&j| j != i && !skip[j] && colors[j] % n == new % n)
+        .collect();
+    for j in conflicts {
+        let used: Vec<usize> = (0..colors.len())
+            .filter(|&k| !skip[k] && k != j)
+            .map(|k| colors[k] % n)
+            .collect();
+        colors[j] = (0..n).find(|c| !used.contains(c)).unwrap_or(old);
+    }
 }
 
 /// Укорачивает длинное имя для кнопки: "очень-длинное-имя" -> "очень-длинное…".
@@ -248,7 +266,7 @@ pub fn seg_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 // Цвета слоёв
 // ---------------------------------------------------------------------------
 
-const PALETTE: [Color32; 8] = [
+const PALETTE: [Color32; 15] = [
     Color32::from_rgb(214, 84, 0),
     Color32::from_rgb(30, 136, 229),
     Color32::from_rgb(46, 160, 67),
@@ -257,7 +275,29 @@ const PALETTE: [Color32; 8] = [
     Color32::from_rgb(0, 137, 123),
     Color32::from_rgb(121, 85, 72),
     Color32::from_rgb(194, 150, 0),
+    Color32::from_rgb(233, 30, 99),
+    Color32::from_rgb(63, 81, 181),
+    Color32::from_rgb(0, 172, 193),
+    Color32::from_rgb(158, 157, 36),
+    Color32::from_rgb(96, 125, 139),
+    Color32::from_rgb(33, 33, 33),
+    Color32::from_rgb(255, 138, 101),
 ];
+
+pub fn palette_len() -> usize {
+    PALETTE.len()
+}
+
+/// Назначает слою `i` цвет из палитры; конфликтующий слой получает другой цвет.
+pub fn assign_color(layers: &mut [Layer], i: usize, new: usize) {
+    let n = PALETTE.len();
+    let mut colors: Vec<usize> = layers.iter().map(|l| l.color % n).collect();
+    let skip: Vec<bool> = layers.iter().map(|l| l.is_borders()).collect();
+    recolor(&mut colors, &skip, i, new, n);
+    for (l, c) in layers.iter_mut().zip(colors) {
+        l.color = c;
+    }
+}
 
 /// Цвет жирных границ стран.
 pub const BORDER_COLOR: Color32 = Color32::from_rgb(70, 62, 90);
@@ -455,6 +495,13 @@ fn status_ru(status: &str) -> String {
         "shelved" => "Заморожен".to_string(),
         "cancelled" => "Отменён".to_string(),
         "retired" => "Выведен из эксплуатации".to_string(),
+        "pre-construction" => "Подготовка к строительству".to_string(),
+        "in-development" => "Разрабатывается".to_string(),
+        "discovered" => "Открыто, не разрабатывается".to_string(),
+        "exploration" => "Разведка".to_string(),
+        "decommissioning" => "Выводится из эксплуатации".to_string(),
+        "abandoned" => "Заброшено".to_string(),
+        "underground gas storage" => "Подземное хранилище газа".to_string(),
         _ => status.to_string(),
     }
 }
@@ -534,6 +581,8 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
         "Тип",
         prop_text(props, "industrial").map(|v| match v.as_str() {
             "refinery" => "НПЗ".to_string(),
+            "oil_storage" => "Нефтебаза / терминал".to_string(),
+            "gas_storage" => "Хранилище газа".to_string(),
             _ => v,
         }),
     );
@@ -546,6 +595,19 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
     );
     add("Мощность", prop_text(props, "capacity"));
     add("Дата ввода", prop_text(props, "start_date"));
+    add("Год открытия", prop_text(props, "DiscoveryYear"));
+    add("Тип реактора", prop_text(props, "Reactor"));
+    add("Технология", prop_text(props, "Technology"));
+    add("Примечание", prop_text(props, "Note"));
+    add("Река", prop_text(props, "River"));
+    add("Турбин", prop_text(props, "Turbines"));
+    add("Блоки", prop_text(props, "Units"));
+    add("Добыча", prop_text(props, "ProductionText"));
+    add("Тип добычи", prop_text(props, "ProductionType"));
+    add("Размещение", prop_text(props, "Placement"));
+    add("Бассейн", prop_text(props, "Basin"));
+    add("Регион", prop_text(props, "Subnational"));
+    add("Площадь, км²", prop_text(props, "area_km2"));
     add("Страна", prop_text(props, "CountriesOrAreas"));
     add("Сегмент", prop_text(props, "SegmentName"));
     add(
@@ -641,9 +703,17 @@ fn parse(bytes: &[u8]) -> Result<Data, String> {
             .and_then(|p| p.get("Status").or_else(|| p.get("status")))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let Some(faded) = faded_for_status(status) else {
+        let Some(mut faded) = faded_for_status(status) else {
             continue;
         };
+        // Приблизительное местоположение рисуем бледнее, как строящиеся объекты
+        let approximate = feature
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("Note"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|n| n.starts_with("Приблизительное"));
+        faded |= approximate;
         let Some(geometry) = feature.geometry else {
             continue; // объект без геометрии (например, трубопровод без известного маршрута)
         };

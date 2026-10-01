@@ -385,13 +385,27 @@ struct PanelResult {
     remove: Option<usize>,
 }
 
-fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer]) -> PanelResult {
+fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut bool) -> PanelResult {
     let mut result = PanelResult::default();
     ui.set_max_width(340.0);
-    ui.strong("Слои").on_hover_text(
-        "Бледным цветом рисуются объекты со статусом «строится», «проект» или «простаивает».\n\
-         Отменённые и выведенные из эксплуатации объекты не показываются.",
-    );
+    ui.horizontal(|ui| {
+        let title = if *collapsed {
+            format!("Слои ({})", layers.len())
+        } else {
+            "Слои".to_string()
+        };
+        ui.strong(title).on_hover_text(
+            "Бледным цветом рисуются объекты со статусом «строится», «проект» или «простаивает».\n\
+             Отменённые и выведенные из эксплуатации объекты не показываются.",
+        );
+        let label = if *collapsed { "Развернуть" } else { "Свернуть" };
+        if ui.small_button(label).clicked() {
+            *collapsed = !*collapsed;
+        }
+    });
+    if *collapsed {
+        return result;
+    }
 
     for (i, layer) in layers.iter_mut().enumerate() {
         ui.horizontal(|ui| {
@@ -471,6 +485,8 @@ struct ViewerApp {
     /// Закреплённая подсказка: объект и место, где по нему нажали
     pinned: Option<(layers::Hit, egui::Pos2)>,
     layers: Vec<layers::Layer>,
+    /// Панель слоёв свёрнута
+    layers_collapsed: bool,
     /// Вшитые в exe границы стран (российская версия, только суша); в списке слоёв не видны
     borders: layers::Layer,
 }
@@ -490,6 +506,7 @@ impl ViewerApp {
             press_pos: None,
             pinned: None,
             layers: Vec::new(),
+            layers_collapsed: false,
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
             )),
@@ -554,7 +571,7 @@ impl ViewerApp {
 }
 
 impl eframe::App for ViewerApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Фоновая загрузка слоёв: забираем готовое и запускаем чтение включённых слоёв
         self.borders.poll();
         self.borders.start_loading(ui.ctx());
@@ -588,6 +605,7 @@ impl eframe::App for ViewerApp {
             centered_row(ui, "toolbar", |ui| {
                 if ui.button("Выбрать карту…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
+                        .set_parent(&*frame)
                         .set_title("Выберите файл карты")
                         .add_filter("Карты PMTiles", &["pmtiles"])
                         .pick_file()
@@ -601,6 +619,7 @@ impl eframe::App for ViewerApp {
                     .on_disabled_hover_text("Сначала выберите карту");
                 if add.clicked() {
                     if let Some(path) = rfd::FileDialog::new()
+                        .set_parent(&*frame)
                         .set_title("Выберите файл слоя")
                         .add_filter("Слои (GeoJSON)", &["geojson", "json"])
                         .pick_file()
@@ -812,7 +831,11 @@ impl eframe::App for ViewerApp {
                         .fixed_pos(map_rect.left_top() + egui::vec2(12.0, 12.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                panel = layers_panel(ui, &mut self.layers);
+                                panel = layers_panel(
+                                    ui,
+                                    &mut self.layers,
+                                    &mut self.layers_collapsed,
+                                );
                             });
                         });
 

@@ -259,6 +259,9 @@ const PALETTE: [Color32; 8] = [
     Color32::from_rgb(194, 150, 0),
 ];
 
+/// Цвет жирных границ стран.
+pub const BORDER_COLOR: Color32 = Color32::from_rgb(70, 62, 90);
+
 pub fn palette_color(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
 }
@@ -424,6 +427,9 @@ pub struct Label {
 /// а main.rs показывает одну подсказку для ближайшего объекта.
 #[derive(Clone, Default)]
 pub struct Hit {
+    /// Номер слоя в списке и номер объекта в слое: по ним объект подсвечивается
+    pub layer: usize,
+    pub label: u32,
     pub dist: f32,
     pub title: String,
     pub details: Vec<String>,
@@ -462,12 +468,13 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
         };
     };
 
-    const TITLE_KEYS: [&str; 10] = [
+    const TITLE_KEYS: [&str; 11] = [
         "PipelineName",
         "Name",
+        "NAME_RU",
+        "name:ru",
         "name",
         "NAME",
-        "name:ru",
         "name:en",
         "Title",
         "title",
@@ -485,6 +492,14 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
                 (low.contains("name") && !skip.iter().any(|w| low.contains(w)))
                     .then(|| prop_text(props, k))
                     .flatten()
+            })
+        })
+        .or_else(|| {
+            // У объектов Natural Earth без названия (железные дороги и т. п.) берём класс
+            prop_text(props, "featurecla").map(|class| match class.as_str() {
+                "Railroad" => "Железная дорога".to_string(),
+                "Road" => "Дорога".to_string(),
+                _ => class,
             })
         })
         .unwrap_or_else(|| "Без названия".to_string());
@@ -509,7 +524,28 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
             .map(|s| status_ru(&s)),
     );
     add("Топливо", prop_text(props, "Fuel"));
-    add("Владелец", prop_text(props, "Owner"));
+    add(
+        "Владелец",
+        prop_text(props, "Owner").or_else(|| prop_text(props, "owner")),
+    );
+    // Поля OpenStreetMap
+    add("Оператор", prop_text(props, "operator"));
+    add(
+        "Тип",
+        prop_text(props, "industrial").map(|v| match v.as_str() {
+            "refinery" => "НПЗ".to_string(),
+            _ => v,
+        }),
+    );
+    add(
+        "Продукция",
+        prop_text(props, "product").map(|v| match v.as_str() {
+            "petroleum" => "Нефтепродукты".to_string(),
+            _ => v,
+        }),
+    );
+    add("Мощность", prop_text(props, "capacity"));
+    add("Дата ввода", prop_text(props, "start_date"));
     add("Страна", prop_text(props, "CountriesOrAreas"));
     add("Сегмент", prop_text(props, "SegmentName"));
     add(
@@ -531,15 +567,35 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
         prop_text(props, "StartLocation"),
         prop_text(props, "EndLocation"),
     ) {
-        (Some(a), Some(b)) => details.push(format!("Маршрут: {a} → {b}")),
+        (Some(a), Some(b)) => details.push(format!("Маршрут: {a} — {b}")),
         (Some(a), None) | (None, Some(a)) => details.push(format!("Место: {a}")),
         (None, None) => {}
     }
+    // Natural Earth (железные дороги и т. п.): показываем только три поля
+    if details.is_empty()
+        && props.contains_key("featurecla")
+        && props.contains_key("continent")
+        && props.contains_key("disp_scale")
+    {
+        for (name, key) in [
+            ("Континент", "continent"),
+            ("Масштаб показа", "disp_scale"),
+            ("Класс", "featurecla"),
+        ] {
+            if let Some(value) = prop_text(props, key) {
+                details.push(format!("{name}: {value}"));
+            }
+        }
+    }
+
     // Файл не из Global Energy Monitor: показываем первые простые свойства как есть
     if details.is_empty() {
         for k in props.keys() {
             if details.len() >= 6 {
                 break;
+            }
+            if k.starts_with("name") || k == "wikidata" || k == "website" {
+                continue;
             }
             if let Some(text) = prop_text(props, k) {
                 if text != title && text.chars().count() <= 80 && !text.starts_with("http") {
@@ -565,10 +621,13 @@ fn load(path: &Path) -> Result<Data, String> {
         return Err(format!("Файл не найден: {}", path.display()));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("Не удалось прочитать файл: {e}"))?;
-    let json = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    parse(&bytes)
+}
+
+fn parse(bytes: &[u8]) -> Result<Data, String> {
+    let json = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     let file: GeoFile = serde_json::from_slice(json)
         .map_err(|e| format!("Файл не похож на GeoJSON (нужен тип FeatureCollection): {e}"))?;
-    drop(bytes);
 
     let mut lines: Vec<Line> = Vec::new();
     let mut dots: Vec<Dot> = Vec::new();
@@ -625,6 +684,8 @@ pub struct Layer {
     pub visible: bool,
     /// Номер цвета в палитре (сохраняется в настройках)
     pub color: usize,
+    /// Данные, вшитые в программу (тогда файл не читается)
+    builtin: Option<&'static [u8]>,
     state: State,
 }
 
@@ -634,7 +695,34 @@ impl Layer {
             path,
             visible,
             color,
+            builtin: None,
             state: State::Idle,
+        }
+    }
+
+    /// Слой из данных, вшитых в exe. В списке слоёв и в настройках его нет.
+    pub fn builtin_borders(bytes: &'static [u8]) -> Self {
+        Self {
+            path: PathBuf::from("admin_0_builtin"),
+            visible: true,
+            color: 0,
+            builtin: Some(bytes),
+            state: State::Idle,
+        }
+    }
+
+    /// Слой границ стран (файл Natural Earth `..._admin_0_...`): рисуется жирной тёмной
+    /// линией, а границы из самой карты на это время скрываются.
+    pub fn is_borders(&self) -> bool {
+        self.name().to_lowercase().contains("admin_0")
+    }
+
+    /// Цвет слоя на карте и в панели.
+    pub fn display_color(&self) -> Color32 {
+        if self.is_borders() {
+            BORDER_COLOR
+        } else {
+            palette_color(self.color)
         }
     }
 
@@ -653,9 +741,13 @@ impl Layer {
         }
         let ctx = ctx.clone();
         let path = self.path.clone();
+        let builtin = self.builtin;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(load(&path));
+            let _ = tx.send(match builtin {
+                Some(bytes) => parse(bytes),
+                None => load(&path),
+            });
             ctx.request_repaint(); // разбудить окно, чтобы показать результат
         });
         self.state = State::Loading(rx);
@@ -707,14 +799,23 @@ impl Layer {
 
 /// Ключ в памяти egui для результата наведения (см. `Hit`).
 pub const HIT_ID: &str = "layer_hover_hit";
+/// Ключ в памяти egui: положение клика или касания в этом кадре (если оно было).
+pub const TAP_ID: &str = "layer_tap_pos";
 /// Насколько близко (в пикселях) нужно навести курсор на линию или точку.
 const LINE_HIT_PX: f32 = 7.0;
+const TAP_HIT_PX: f32 = 14.0;
 const DOT_BONUS_PX: f32 = 3.0;
 
 /// Плагин карты, который рисует один слой.
 pub struct LayerPlugin<'a> {
     pub data: &'a Data,
     pub color: Color32,
+    /// Границы стран: жирная линия, без подсказок
+    pub borders: bool,
+    /// Номер слоя в списке (для подсветки выбранного объекта)
+    pub layer_id: usize,
+    /// Объект этого слоя, по которому нажали: рисуется выделенным
+    pub selected: Option<u32>,
 }
 
 impl Plugin for LayerPlugin<'_> {
@@ -745,10 +846,17 @@ impl Plugin for LayerPlugin<'_> {
         let painter = ui.painter_at(rect);
 
         // Курсор над картой (но не во время перетаскивания и не над кнопками)
-        let pointer = if response.hovered() && !response.dragged() {
-            ui.input(|i| i.pointer.hover_pos())
+        // Касание или клик (его положение кладёт в память main.rs) ловится с запасом побольше,
+        // потому что палец менее точен, чем курсор
+        let tap = ui.ctx().data(|d| d.get_temp::<Pos2>(egui::Id::new(TAP_ID)));
+        let (pointer, reach) = if self.borders {
+            (None, LINE_HIT_PX) // у границ стран подсказок нет
+        } else if let Some(tap) = tap {
+            (Some(tap), TAP_HIT_PX)
+        } else if response.hovered() && !response.dragged() {
+            (ui.input(|i| i.pointer.hover_pos()), LINE_HIT_PX)
         } else {
-            None
+            (None, LINE_HIT_PX)
         };
         let mut best: Option<(f32, u32)> = None; // (расстояние в пикселях, номер подписи)
 
@@ -759,7 +867,9 @@ impl Plugin for LayerPlugin<'_> {
             if !line.overlaps(view) {
                 continue;
             }
-            let stroke = if line.faded {
+            let stroke = if self.borders {
+                Stroke::new(1.5, solid)
+            } else if line.faded {
                 Stroke::new(1.5, pale)
             } else {
                 Stroke::new(2.0, solid)
@@ -768,7 +878,7 @@ impl Plugin for LayerPlugin<'_> {
                 if let Some(p) = pointer {
                     for w in run.windows(2) {
                         let d = seg_distance((p.x, p.y), (w[0].x, w[0].y), (w[1].x, w[1].y));
-                        if d <= LINE_HIT_PX && best.is_none_or(|b| d < b.0) {
+                        if d <= reach && best.is_none_or(|b| d < b.0) {
                             best = Some((d, line.label));
                         }
                     }
@@ -793,9 +903,37 @@ impl Plugin for LayerPlugin<'_> {
             if let Some(p) = pointer {
                 // Точки легче поймать, чем линии: вычитаем небольшой бонус
                 let d = ((p.x - sx).powi(2) + (p.y - sy).powi(2)).sqrt() - DOT_BONUS_PX;
-                if d <= LINE_HIT_PX && best.is_none_or(|b| d < b.0) {
+                if d <= reach && best.is_none_or(|b| d < b.0) {
                     best = Some((d, dot.label));
                 }
+            }
+        }
+
+        // Выбранный нажатием объект: белый ореол и более толстая линия поверх остальных
+        if let Some(sel) = self.selected {
+            let halo = Stroke::new(8.0, Color32::from_white_alpha(235));
+            let main = Stroke::new(4.5, solid);
+            for line in self.data.lines.iter().filter(|l| l.label == sel) {
+                if !line.overlaps(view) {
+                    continue;
+                }
+                visible_runs(line.lod(max_tol), &t, clip, Pos2::new, |run| {
+                    painter.add(Shape::line(run.clone(), halo));
+                    painter.add(Shape::line(run, main));
+                });
+            }
+            for dot in self.data.dots.iter().filter(|d| d.label == sel) {
+                let [x, y] = dot.pos;
+                if x < view[0] || x > view[2] || y < view[1] || y > view[3] {
+                    continue;
+                }
+                let (sx, sy) = t.screen(&dot.pos);
+                painter.circle(
+                    Pos2::new(sx, sy),
+                    9.0,
+                    solid,
+                    Stroke::new(3.0, Color32::WHITE),
+                );
             }
         }
 
@@ -808,6 +946,8 @@ impl Plugin for LayerPlugin<'_> {
                         data.insert_temp(
                             id,
                             Hit {
+                                layer: self.layer_id,
+                                label: index,
                                 dist,
                                 title: label.title.clone(),
                                 details: label.details.clone(),

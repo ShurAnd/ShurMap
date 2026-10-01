@@ -14,6 +14,8 @@ use std::{
 use walkers::{Map, MapMemory, PmTiles, Style, lon_lat};
 
 const APP_NAME: &str = "ShurMap";
+/// Версия берётся из Cargo.toml (поле version), чтобы её не нужно было менять в двух местах
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Журнал запуска и сообщения об ошибках
@@ -64,11 +66,28 @@ fn localize(v: &mut Value) {
     }
 }
 
-fn localized_style() -> Style {
+/// `hide_boundaries` убирает из стиля слои границ (их заменяет слой границ стран).
+fn localized_style(hide_boundaries: bool) -> Style {
     let mut style_json: Value =
         serde_json::from_str(include_str!("../assets/protomaps-light.json"))
             .expect("bad style json");
     localize(&mut style_json);
+    // Названия стран ярче и контрастнее, чем в стандартном стиле
+    if let Some(list) = style_json["layers"].as_array_mut() {
+        for l in list.iter_mut() {
+            if l["id"].as_str() == Some("places_country") {
+                l["paint"]["text-color"] = json!("#3b2f7a");
+                l["paint"]["text-halo-color"] = json!("#ffffff");
+            }
+        }
+    }
+    if hide_boundaries && let Some(list) = style_json["layers"].as_array_mut() {
+        list.retain(|l| {
+            let source = l["source-layer"].as_str().unwrap_or("");
+            let id = l["id"].as_str().unwrap_or("");
+            source != "boundaries" && !id.starts_with("boundaries")
+        });
+    }
     serde_json::from_value(style_json).expect("failed to build style")
 }
 
@@ -260,6 +279,51 @@ fn zoom_control(ui: &mut egui::Ui) -> f64 {
 // Ряд кнопок по центру и панель слоёв
 // ---------------------------------------------------------------------------
 
+/// Карточка с названием и сведениями об объекте рядом с точкой `at`.
+fn show_tooltip(
+    ctx: &egui::Context,
+    id: &str,
+    hit: &layers::Hit,
+    at: egui::Pos2,
+    map_rect: egui::Rect,
+    pinned: bool,
+) {
+    let right = at.x > map_rect.center().x;
+    let below = at.y > map_rect.center().y;
+    let pivot = match (right, below) {
+        (false, false) => egui::Align2::LEFT_TOP,
+        (true, false) => egui::Align2::RIGHT_TOP,
+        (false, true) => egui::Align2::LEFT_BOTTOM,
+        (true, true) => egui::Align2::RIGHT_BOTTOM,
+    };
+    let offset = egui::vec2(
+        if right { -14.0 } else { 14.0 },
+        if below { -14.0 } else { 14.0 },
+    );
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .pivot(pivot)
+        .fixed_pos(at + offset)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width(360.0);
+                ui.horizontal(|ui| {
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(r, 2.0, hit.color);
+                    ui.strong(&hit.title);
+                });
+                for line in &hit.details {
+                    ui.label(line);
+                }
+                if pinned {
+                    ui.small("Нажмите ещё раз, чтобы закрыть");
+                }
+            });
+        });
+}
+
 /// Ставит ряд виджетов по центру доступной ширины. Ширина ряда запоминается с прошлого
 /// кадра, поэтому в самый первый кадр ряд на мгновение стоит слева.
 fn centered_row(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -277,6 +341,41 @@ fn centered_row(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui
             ui.ctx().request_repaint();
         }
     });
+}
+
+/// Кнопка-корзина, нарисованная линиями (в шрифте нет надёжного значка корзины).
+fn trash_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter()
+            .rect_filled(rect, 4.0, egui::Color32::from_rgb(253, 232, 232));
+    }
+    let color = if hovered {
+        egui::Color32::from_rgb(200, 40, 40)
+    } else {
+        egui::Color32::from_gray(110)
+    };
+    let stroke = egui::Stroke::new(1.5, color);
+    let c = rect.center();
+    let p = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
+    let painter = ui.painter();
+    // Крышка и ручка
+    painter.line_segment([p(-6.0, -4.0), p(6.0, -4.0)], stroke);
+    painter.add(egui::Shape::line(
+        vec![p(-2.0, -4.0), p(-2.0, -6.5), p(2.0, -6.5), p(2.0, -4.0)],
+        stroke,
+    ));
+    // Корпус
+    painter.add(egui::Shape::line(
+        vec![p(-4.5, -2.0), p(-3.8, 6.5), p(3.8, 6.5), p(4.5, -2.0)],
+        stroke,
+    ));
+    // Две вертикальные риски
+    painter.line_segment([p(-1.5, 0.0), p(-1.5, 4.5)], stroke);
+    painter.line_segment([p(1.5, 0.0), p(1.5, 4.5)], stroke);
+    response
 }
 
 /// Что произошло в панели слоёв за кадр.
@@ -298,8 +397,7 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer]) -> PanelResult 
         ui.horizontal(|ui| {
             // Цвет слоя
             let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 3.0, layers::palette_color(layer.color));
+            ui.painter().rect_filled(rect, 3.0, layer.display_color());
 
             // Кнопка слоя: нажата = слой включён
             let hover = format!(
@@ -325,8 +423,7 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer]) -> PanelResult 
                 ui.spinner();
             }
 
-            if ui
-                .small_button("×")
+            if trash_button(ui)
                 .on_hover_text("Убрать слой из списка")
                 .clicked()
             {
@@ -359,6 +456,8 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer]) -> PanelResult 
 
 struct ViewerApp {
     tiles: Option<PmTiles>,
+    /// Скрыты ли сейчас границы из самой карты
+    boundaries_hidden: bool,
     file: Option<PathBuf>,
     map_memory: MapMemory,
     center: (f64, f64), // долгота, широта
@@ -367,13 +466,20 @@ struct ViewerApp {
     /// Границы новой карты, по которым при первом показе подбирается масштаб
     pending_fit: Option<[f64; 4]>,
     fit_tries: u32,
+    /// Где началось нажатие (чтобы отличить касание от перетаскивания)
+    press_pos: Option<egui::Pos2>,
+    /// Закреплённая подсказка: объект и место, где по нему нажали
+    pinned: Option<(layers::Hit, egui::Pos2)>,
     layers: Vec<layers::Layer>,
+    /// Вшитые в exe границы стран (российская версия, только суша); в списке слоёв не видны
+    borders: layers::Layer,
 }
 
 impl ViewerApp {
     fn new() -> Self {
         Self {
             tiles: None,
+            boundaries_hidden: false,
             file: None,
             map_memory: MapMemory::default(),
             center: (0.0, 0.0),
@@ -381,7 +487,12 @@ impl ViewerApp {
             max_zoom: 12.0,
             pending_fit: None,
             fit_tries: 0,
+            press_pos: None,
+            pinned: None,
             layers: Vec::new(),
+            borders: layers::Layer::builtin_borders(include_bytes!(
+                "../assets/borders_rus.geojson"
+            )),
         }
     }
 
@@ -416,8 +527,10 @@ impl ViewerApp {
         // Масштаб подбирается в ui(), когда известен размер окна
         self.pending_fit = Some(info.bounds);
         self.fit_tries = 0;
+        self.pinned = None;
 
-        self.tiles = Some(PmTiles::with_style(&path, localized_style(), ctx));
+        self.boundaries_hidden = false;
+        self.tiles = Some(PmTiles::with_style(&path, localized_style(false), ctx));
         self.file = Some(path);
         self.save_settings();
     }
@@ -443,11 +556,31 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Фоновая загрузка слоёв: забираем готовое и запускаем чтение включённых слоёв
+        self.borders.poll();
+        self.borders.start_loading(ui.ctx());
         for layer in &mut self.layers {
             layer.poll();
             if layer.visible {
                 layer.start_loading(ui.ctx());
             }
+        }
+
+        // Пока включён и загружен слой границ стран, границы самой карты скрываем
+        // (иначе рядом с жирной линией была бы вторая, тонкая и другая)
+        let want_hidden = self.borders.data().is_some()
+            || self
+                .layers
+                .iter()
+                .any(|l| l.visible && l.is_borders() && l.data().is_some());
+        if want_hidden != self.boundaries_hidden
+            && let Some(file) = self.file.clone()
+        {
+            self.tiles = Some(PmTiles::with_style(
+                &file,
+                localized_style(want_hidden),
+                ui.ctx().clone(),
+            ));
+            self.boundaries_hidden = want_hidden;
         }
 
         // Верхняя панель: две кнопки по центру
@@ -490,6 +623,35 @@ impl eframe::App for ViewerApp {
         // Область под панелью, которую занимает карта
         let map_rect = ui.available_rect_before_wrap();
 
+        // Касание или клик (без перетаскивания) по карте, не по кнопкам и панелям
+        let mut tap: Option<egui::Pos2> = None;
+        let (pressed, released, pos) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+        if pressed {
+            self.press_pos = pos;
+        }
+        if released
+            && let (Some(a), Some(b)) = (self.press_pos.take(), pos)
+            && a.distance(b) < 10.0
+            && map_rect.contains(b)
+            && ui.ctx().layer_id_at(b) == Some(ui.layer_id())
+        {
+            tap = Some(b);
+        }
+        ui.ctx().data_mut(|d| match tap {
+            Some(p) => {
+                d.insert_temp(egui::Id::new(layers::TAP_ID), p);
+            }
+            None => {
+                d.remove_temp::<egui::Pos2>(egui::Id::new(layers::TAP_ID));
+            }
+        });
+
         // F11 — полноэкранный режим
         if ui.input(|i| i.key_pressed(egui::Key::F11)) {
             let full = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
@@ -510,14 +672,31 @@ impl eframe::App for ViewerApp {
                 .drag_pan_buttons(egui::DragPanButtons::PRIMARY);
 
                 // Слои рисуются поверх карты в порядке списка
-                for layer in &self.layers {
+                if let Some(data) = self.borders.data() {
+                    map = map.with_plugin(layers::LayerPlugin {
+                        data,
+                        color: self.borders.display_color(),
+                        borders: true,
+                        layer_id: usize::MAX,
+                        selected: None,
+                    });
+                }
+                for (index, layer) in self.layers.iter().enumerate() {
                     if !layer.visible {
                         continue;
                     }
                     if let Some(data) = layer.data() {
+                        let selected = self
+                            .pinned
+                            .as_ref()
+                            .filter(|(h, _)| h.layer == index)
+                            .map(|(h, _)| h.label);
                         map = map.with_plugin(layers::LayerPlugin {
                             data,
-                            color: layers::palette_color(layer.color),
+                            color: layer.display_color(),
+                            borders: layer.is_borders(),
+                            layer_id: index,
+                            selected,
                         });
                     }
                 }
@@ -564,44 +743,37 @@ impl eframe::App for ViewerApp {
                     let _ = self.map_memory.set_zoom(self.max_zoom);
                 }
 
-                // Подсказка с названием объекта под курсором
-                if let Some(hit) = hit
+                // Нажатие по объекту закрепляет подсказку; повторное нажатие по нему, по другому
+                // месту карты или по другому объекту меняет или убирает её
+                if let Some(p) = tap {
+                    self.pinned = match (hit.clone(), self.pinned.take()) {
+                        (Some(h), Some((old, _)))
+                            if h.layer == old.layer && h.label == old.label =>
+                        {
+                            None
+                        }
+                        (Some(h), _) => Some((h, p)),
+                        (None, _) => None,
+                    };
+                }
+
+                if let Some((pinned, at)) = &self.pinned {
+                    show_tooltip(ui.ctx(), "pinned_tooltip", pinned, *at, map_rect, true);
+                }
+
+                // Подсказка при наведении курсора (не показываем лишний раз для закреплённого)
+                if tap.is_none()
+                    && let Some(hit) = &hit
                     && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
                 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    let right = pointer.x > map_rect.center().x;
-                    let below = pointer.y > map_rect.center().y;
-                    let pivot = match (right, below) {
-                        (false, false) => egui::Align2::LEFT_TOP,
-                        (true, false) => egui::Align2::RIGHT_TOP,
-                        (false, true) => egui::Align2::LEFT_BOTTOM,
-                        (true, true) => egui::Align2::RIGHT_BOTTOM,
-                    };
-                    let offset = egui::vec2(
-                        if right { -14.0 } else { 14.0 },
-                        if below { -14.0 } else { 14.0 },
-                    );
-                    egui::Area::new(egui::Id::new("hover_tooltip"))
-                        .order(egui::Order::Tooltip)
-                        .interactable(false)
-                        .pivot(pivot)
-                        .fixed_pos(pointer + offset)
-                        .show(ui.ctx(), |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.set_max_width(360.0);
-                                ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(
-                                        egui::vec2(10.0, 10.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().rect_filled(r, 2.0, hit.color);
-                                    ui.strong(&hit.title);
-                                });
-                                for line in &hit.details {
-                                    ui.label(line);
-                                }
-                            });
-                        });
+                    let is_pinned = self
+                        .pinned
+                        .as_ref()
+                        .is_some_and(|(p, _)| p.layer == hit.layer && p.label == hit.label);
+                    if !is_pinned {
+                        show_tooltip(ui.ctx(), "hover_tooltip", hit, pointer, map_rect, false);
+                    }
                 }
 
                 // Кнопка полноэкранного режима над кнопками + / −
@@ -645,9 +817,11 @@ impl eframe::App for ViewerApp {
                         });
 
                     if let Some(i) = panel.remove {
+                        self.pinned = None;
                         self.layers.remove(i);
                         self.save_settings();
                     } else if panel.changed {
+                        self.pinned = None;
                         self.save_settings();
                     }
                 }
@@ -688,7 +862,7 @@ fn main() {
         }
     }
 
-    log_step("--- start ---");
+    log_step(&format!("--- start {APP_VERSION} ---"));
     env_logger::init();
 
     // Паники показываем окном (в релизной сборке нет консоли)
@@ -700,7 +874,7 @@ fn main() {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
-            .with_title(APP_NAME)
+            .with_title(format!("{APP_NAME} {APP_VERSION}"))
             .with_icon(load_icon())
             .with_inner_size([1200.0, 800.0]),
         ..Default::default()

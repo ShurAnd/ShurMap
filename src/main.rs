@@ -10,10 +10,13 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use walkers::{Map, MapMemory, PmTiles, Style, lon_lat};
 
 const APP_NAME: &str = "ShurMap";
+/// Нейтральный светло-серый фон вокруг карты (виден, когда карта отдалена до размера меньше окна)
+const MAP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(222, 225, 230);
 /// Версия берётся из Cargo.toml (поле version), чтобы её не нужно было менять в двух местах
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -32,6 +35,22 @@ fn log_step(text: &str) {
             .open(dir.join("startup.log"))
         {
             let _ = writeln!(f, "{text}");
+        }
+    }
+}
+
+/// Запущено ли приложение как дочерний процесс с выбранным графическим бэкендом (см. `supervise`).
+static CHILD: AtomicBool = AtomicBool::new(false);
+/// Нарисован ли хотя бы один кадр: после этого сбой уже не связан с выбором бэкенда.
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// Отмечает первый успешно нарисованный кадр: пишет в журнал и создаёт файл-флаг,
+/// по которому родительский процесс понимает, что графика заработала.
+fn mark_ready() {
+    if !READY.swap(true, Ordering::Relaxed) {
+        log_step("first frame drawn");
+        if let Some(dir) = settings::config_dir() {
+            let _ = std::fs::write(dir.join("ready.flag"), "1");
         }
     }
 }
@@ -117,11 +136,14 @@ fn read_info(path: &Path) -> Option<FileInfo> {
 
     let (min_lon, min_lat, max_lon, max_lat) = (coord(102), coord(106), coord(110), coord(114));
 
+    // В повреждённом заголовке минимальный масштаб может оказаться больше максимального;
+    // `clamp(min, max)` при этом вызвал бы панику
+    let (z_a, z_b) = (b[100], b[101]);
     Some(FileInfo {
         center: ((min_lon + max_lon) / 2.0, (min_lat + max_lat) / 2.0),
         bounds: [min_lon, min_lat, max_lon, max_lat],
-        min_zoom: b[100] as f64,
-        max_zoom: b[101] as f64,
+        min_zoom: z_a.min(z_b) as f64,
+        max_zoom: z_a.max(z_b) as f64,
     })
 }
 
@@ -412,9 +434,16 @@ fn color_picker(
                                 *j != current && !l.is_borders() && l.color % n == idx
                             });
                             let r = if let Some((_, l)) = owner {
-                                ui.painter().circle_filled(rect.center(), 4.5, egui::Color32::WHITE);
-                                ui.painter()
-                                    .circle_stroke(rect.center(), 4.5, egui::Stroke::new(1.0, dark));
+                                ui.painter().circle_filled(
+                                    rect.center(),
+                                    4.5,
+                                    egui::Color32::WHITE,
+                                );
+                                ui.painter().circle_stroke(
+                                    rect.center(),
+                                    4.5,
+                                    egui::Stroke::new(1.0, dark),
+                                );
                                 r.on_hover_text(format!(
                                     "Занят слоем «{}». Он получит другой цвет.",
                                     l.name()
@@ -444,7 +473,11 @@ struct PanelResult {
     color_click: Option<(usize, egui::Rect)>,
 }
 
-fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut bool) -> PanelResult {
+fn layers_panel(
+    ui: &mut egui::Ui,
+    layers: &mut [layers::Layer],
+    collapsed: &mut bool,
+) -> PanelResult {
     let mut result = PanelResult::default();
     ui.set_max_width(340.0);
     ui.horizontal(|ui| {
@@ -457,7 +490,11 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut
             "Бледным цветом рисуются объекты со статусом «строится», «проект» или «простаивает».\n\
              Отменённые и выведенные из эксплуатации объекты не показываются.",
         );
-        let label = if *collapsed { "Развернуть" } else { "Свернуть" };
+        let label = if *collapsed {
+            "Развернуть"
+        } else {
+            "Свернуть"
+        };
         if ui.small_button(label).clicked() {
             *collapsed = !*collapsed;
         }
@@ -466,60 +503,78 @@ fn layers_panel(ui: &mut egui::Ui, layers: &mut [layers::Layer], collapsed: &mut
         return result;
     }
 
-    for (i, layer) in layers.iter_mut().enumerate() {
-        ui.horizontal(|ui| {
-            // Цвет слоя
-            let (rect, swatch) =
-                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-            ui.painter().rect_filled(rect, 3.0, layer.display_color());
-            if !layer.is_borders() {
-                let swatch = swatch
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Изменить цвет слоя");
-                if swatch.clicked() {
-                    result.color_click = Some((i, rect));
+    // Строки слоёв. Короткий список рисуется как есть: высота подгоняется под содержимое.
+    // Длинный (больше MAX_ROWS) прокручивается в окне фиксированной высоты. Автоподгонка
+    // ScrollArea под содержимое здесь не используется: после сворачивания и разворачивания
+    // панели она «запоминала» высоту в три строки.
+    const MAX_ROWS: usize = 15;
+    let many = layers.len() > MAX_ROWS;
+    let mut rows = |ui: &mut egui::Ui| {
+        for (i, layer) in layers.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                // Цвет слоя
+                let (rect, swatch) =
+                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                ui.painter().rect_filled(rect, 3.0, layer.display_color());
+                if !layer.is_borders() {
+                    let swatch = swatch
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Изменить цвет слоя");
+                    if swatch.clicked() {
+                        result.color_click = Some((i, rect));
+                    }
                 }
-            }
 
-            // Кнопка слоя: нажата = слой включён
-            let hover = format!(
-                "{}\n{}",
-                layer.path.display(),
-                layer
-                    .data()
-                    .map(|d| format!("Объектов на карте: {}", d.objects))
-                    .unwrap_or_default()
-            );
-            let mut visible = layer.visible;
-            ui.toggle_value(&mut visible, layers::short_name(&layer.name(), 28))
-                .on_hover_text(hover);
-            if visible != layer.visible {
-                layer.visible = visible;
-                if visible {
-                    layer.retry_if_failed();
+                // Кнопка слоя: нажата = слой включён
+                let hover = format!(
+                    "{}\n{}",
+                    layer.path.display(),
+                    layer
+                        .data()
+                        .map(|d| format!("Объектов на карте: {}", d.objects))
+                        .unwrap_or_default()
+                );
+                let mut visible = layer.visible;
+                ui.toggle_value(&mut visible, layers::short_name(&layer.name(), 28))
+                    .on_hover_text(hover);
+                if visible != layer.visible {
+                    layer.visible = visible;
+                    if visible {
+                        layer.retry_if_failed();
+                    }
+                    result.changed = true;
                 }
-                result.changed = true;
-            }
 
-            if layer.is_loading() {
-                ui.spinner();
-            }
+                if layer.is_loading() {
+                    ui.spinner();
+                }
 
-            if trash_button(ui)
-                .on_hover_text("Убрать слой из списка")
-                .clicked()
-            {
-                result.remove = Some(i);
-            }
-        });
+                if trash_button(ui)
+                    .on_hover_text("Убрать слой из списка")
+                    .clicked()
+                {
+                    result.remove = Some(i);
+                }
+            });
 
-        if layer.visible {
-            if let Some(message) = layer.error() {
-                ui.colored_label(egui::Color32::from_rgb(200, 50, 50), message);
-            } else if layer.data().is_some_and(|d| d.objects == 0) {
-                ui.small("В файле нет объектов для показа (нужны линии, точки или контуры).");
+            if layer.visible {
+                if let Some(message) = layer.error() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 50, 50), message);
+                } else if layer.data().is_some_and(|d| d.objects == 0) {
+                    ui.small("В файле нет объектов для показа (нужны линии, точки или контуры).");
+                }
             }
         }
+    };
+    if many {
+        egui::ScrollArea::vertical()
+            .id_salt("layers_scroll")
+            .auto_shrink([false, false])
+            .min_scrolled_height(420.0)
+            .max_height(420.0)
+            .show(ui, |ui| rows(ui));
+    } else {
+        rows(ui);
     }
 
     // Лицензия данных Global Energy Monitor требует указывать источник
@@ -623,6 +678,7 @@ impl ViewerApp {
         self.save_settings();
     }
 
+    /// Добавляет в список слой из файла (настройки не сохраняет: это делает вызывающий код).
     fn add_layer(&mut self, path: PathBuf) {
         // Границы стран вшиты в программу и всегда включены: отдельным слоем их не добавляем
         if layers::Layer::new(path.clone(), true, 0).is_borders() {
@@ -636,7 +692,6 @@ impl ViewerApp {
             let color = layers::next_color(&self.layers);
             self.layers.push(layers::Layer::new(path, true, color));
         }
-        self.save_settings();
     }
 
     fn change_zoom(&mut self, delta: f64) {
@@ -647,6 +702,7 @@ impl ViewerApp {
 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        mark_ready();
         // Фоновая загрузка слоёв: забираем готовое и запускаем чтение включённых слоёв
         self.borders.poll();
         self.borders.start_loading(ui.ctx());
@@ -690,16 +746,22 @@ impl eframe::App for ViewerApp {
                 }
 
                 let add = ui
-                    .add_enabled(self.tiles.is_some(), egui::Button::new("Добавить слой…"))
+                    .add_enabled(self.tiles.is_some(), egui::Button::new("Добавить слои…"))
                     .on_disabled_hover_text("Сначала выберите карту");
                 if add.clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                    // Можно выбрать сразу несколько файлов (Ctrl или Shift в окне выбора)
+                    if let Some(mut paths) = rfd::FileDialog::new()
                         .set_parent(&*frame)
-                        .set_title("Выберите файл слоя")
+                        .set_title("Выберите файлы слоёв (можно несколько)")
                         .add_filter("Слои (GeoJSON)", &["geojson", "json"])
-                        .pick_file()
+                        .pick_files()
                     {
-                        self.add_layer(path);
+                        // Порядок слоёв и цветов не зависит от порядка выбора в окне
+                        paths.sort();
+                        for path in paths {
+                            self.add_layer(path);
+                        }
+                        self.save_settings();
                     }
                 }
             });
@@ -716,6 +778,12 @@ impl eframe::App for ViewerApp {
 
         // Область под панелью, которую занимает карта
         let map_rect = ui.available_rect_before_wrap();
+
+        // Фон за картой: при сильном отдалении карта не занимает всё окно, и без заливки
+        // вокруг неё было бы чёрное поле. Заливка рисуется раньше карты, то есть под ней.
+        if self.tiles.is_some() {
+            ui.painter().rect_filled(map_rect, 0.0, MAP_BACKGROUND);
+        }
 
         // Касание или клик (без перетаскивания) по карте, не по кнопкам и панелям
         let mut tap: Option<egui::Pos2> = None;
@@ -906,11 +974,8 @@ impl eframe::App for ViewerApp {
                         .fixed_pos(map_rect.left_top() + egui::vec2(12.0, 12.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                panel = layers_panel(
-                                    ui,
-                                    &mut self.layers,
-                                    &mut self.layers_collapsed,
-                                );
+                                panel =
+                                    layers_panel(ui, &mut self.layers, &mut self.layers_collapsed);
                             });
                         });
 
@@ -981,24 +1046,156 @@ fn load_icon() -> egui::IconData {
     }
 }
 
-fn main() {
-    // DirectX 12 по умолчанию, если бэкенд не выбран вручную (на некоторых ноутбуках
-    // бэкенд по умолчанию вызывает сбой)
-    #[cfg(windows)]
-    {
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            // SAFETY: вызывается в самом начале, пока других потоков нет
-            unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+/// Графические бэкенды в порядке попыток: сначала DirectX 12, затем Vulkan, затем OpenGL.
+const BACKENDS: [&str; 3] = ["dx12", "vulkan", "gl"];
+
+fn backend_file() -> Option<PathBuf> {
+    settings::config_dir().map(|d| d.join("backend.txt"))
+}
+
+/// Сколько секунд ждём первого кадра от дочернего процесса, прежде чем считать запуск зависшим.
+#[cfg(windows)]
+const FIRST_FRAME_TIMEOUT_SECS: u64 = 60;
+
+/// Родительский процесс (только Windows): запускает ShurMap с `--backend=...` по очереди.
+/// Как только дочерний процесс нарисовал первый кадр (появился файл-флаг), родитель
+/// завершается, а окно живёт само. Если дочерний процесс завершился или завис до первого
+/// кадра (ошибка или сбой драйвера), пробуется следующий бэкенд. Сработавший запоминается
+/// в backend.txt (файл переписывается только при изменении) и в следующий раз идёт первым.
+/// Возвращает код выхода или None, если запустить дочерний процесс нельзя.
+#[cfg(windows)]
+fn supervise() -> Option<i32> {
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().ok()?;
+    let dir = settings::config_dir()?;
+    let flag = dir.join("ready.flag");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let saved = backend_file()
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|t| t.trim().to_string());
+    let mut order: Vec<&str> = Vec::new();
+    if let Some(b) = BACKENDS.iter().find(|b| Some(**b) == saved.as_deref()) {
+        order.push(b);
+    }
+    for b in BACKENDS {
+        if !order.contains(&b) {
+            order.push(b);
         }
     }
 
+    // Остальные аргументы командной строки передаём как есть
+    let extra: Vec<_> = std::env::args_os()
+        .skip(1)
+        .filter(|a| !a.to_string_lossy().starts_with("--backend="))
+        .collect();
+
+    let mut last_code = 1;
+    for backend in order {
+        let _ = std::fs::remove_file(&flag);
+        log_step(&format!("launching with graphics backend: {backend}"));
+        let mut child = match std::process::Command::new(&exe)
+            .arg(format!("--backend={backend}"))
+            .args(&extra)
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                log_step(&format!("could not start child process: {e}"));
+                return None;
+            }
+        };
+
+        let started = Instant::now();
+        loop {
+            if flag.exists() {
+                // Окно работает: запоминаем бэкенд (только если он изменился) и выходим
+                if saved.as_deref() != Some(backend) {
+                    if let Some(f) = backend_file() {
+                        let _ = std::fs::write(f, backend);
+                    }
+                }
+                return Some(0);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Мог успеть нарисовать кадр и сразу закрыться
+                    if flag.exists() || status.success() {
+                        return Some(status.code().unwrap_or(0));
+                    }
+                    last_code = status.code().unwrap_or(1);
+                    log_step(&format!(
+                        "backend {backend} failed before the first frame (code {last_code})"
+                    ));
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log_step(&format!("could not wait for child process: {e}"));
+                    return Some(1);
+                }
+            }
+            if started.elapsed() > Duration::from_secs(FIRST_FRAME_TIMEOUT_SECS) {
+                log_step(&format!("backend {backend}: no first frame, killing"));
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    show_error(&format!(
+        "ShurMap не смог запустить графику ни через DirectX 12, ни через Vulkan, ни через OpenGL.\n\n\
+         Обновите драйвер видеокарты. Подробности записаны в файл:\n{}",
+        dir.join("startup.log").display()
+    ));
+    Some(last_code)
+}
+
+fn main() {
+    let backend_arg =
+        std::env::args().find_map(|a| a.strip_prefix("--backend=").map(str::to_owned));
+
+    if let Some(backend) = backend_arg {
+        // Дочерний процесс: бэкенд выбран родителем
+        CHILD.store(true, Ordering::Relaxed);
+        // SAFETY: вызывается в самом начале, пока других потоков нет
+        unsafe { std::env::set_var("WGPU_BACKEND", backend) };
+    } else if std::env::var_os("WGPU_BACKEND").is_none() {
+        // Бэкенд не выбран вручную: на Windows перебираем DX12, Vulkan, OpenGL
+        #[cfg(windows)]
+        {
+            match supervise() {
+                Some(code) => std::process::exit(code),
+                // Дочерний процесс запустить не удалось: работаем в этом процессе на DX12
+                None => unsafe { std::env::set_var("WGPU_BACKEND", "dx12") },
+            }
+        }
+    }
+
+    run_app();
+}
+
+fn run_app() {
     log_step(&format!("--- start {APP_VERSION} ---"));
     env_logger::init();
 
-    // Паники показываем окном (в релизной сборке нет консоли)
+    // Паники пишем в журнал всегда, а окно показываем только для главного потока и только
+    // если графика уже заработала. Паника фонового потока (например, чтения слоя) не
+    // останавливает программу: слой просто покажет ошибку. Паника до первого кадра в
+    // дочернем процессе - повод для родителя попробовать другой бэкенд.
     std::panic::set_hook(Box::new(|info| {
-        log_step(&format!("PANIC: {info}"));
-        show_error(&format!("ShurMap аварийно завершился:\n\n{info}"));
+        let on_main = std::thread::current().name() == Some("main");
+        log_step(&format!(
+            "PANIC ({}): {info}",
+            std::thread::current().name().unwrap_or("поток")
+        ));
+        let silent = CHILD.load(Ordering::Relaxed) && !READY.load(Ordering::Relaxed);
+        if on_main && !silent {
+            show_error(&format!("ShurMap аварийно завершился:\n\n{info}"));
+        }
     }));
 
     let options = eframe::NativeOptions {
@@ -1041,6 +1238,10 @@ fn main() {
 
     if let Err(e) = result {
         log_step(&format!("ERROR: {e}"));
+        if CHILD.load(Ordering::Relaxed) {
+            // Родитель увидит, что кадр не нарисован, и попробует другой бэкенд
+            std::process::exit(3);
+        }
         show_error(&format!("ShurMap не смог запуститься:\n\n{e}"));
     }
     log_step("exited normally");

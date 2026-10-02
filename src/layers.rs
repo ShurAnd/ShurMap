@@ -266,7 +266,7 @@ pub fn seg_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 // Цвета слоёв
 // ---------------------------------------------------------------------------
 
-const PALETTE: [Color32; 15] = [
+const PALETTE: [Color32; 25] = [
     Color32::from_rgb(214, 84, 0),
     Color32::from_rgb(30, 136, 229),
     Color32::from_rgb(46, 160, 67),
@@ -282,6 +282,16 @@ const PALETTE: [Color32; 15] = [
     Color32::from_rgb(96, 125, 139),
     Color32::from_rgb(33, 33, 33),
     Color32::from_rgb(255, 138, 101),
+    Color32::from_rgb(124, 179, 66),  // салатовый
+    Color32::from_rgb(136, 14, 79),   // бордовый
+    Color32::from_rgb(13, 71, 161),   // тёмно-синий
+    Color32::from_rgb(27, 94, 32),    // тёмно-зелёный
+    Color32::from_rgb(186, 0, 160),   // фуксия
+    Color32::from_rgb(149, 117, 205), // сиреневый
+    Color32::from_rgb(0, 200, 83),    // изумрудный
+    Color32::from_rgb(255, 193, 7),   // янтарный
+    Color32::from_rgb(161, 136, 127), // серо-коричневый
+    Color32::from_rgb(240, 98, 146),  // розовый светлый
 ];
 
 pub fn palette_len() -> usize {
@@ -308,8 +318,38 @@ pub fn palette_color(index: usize) -> Color32 {
 
 /// Номер цвета для нового слоя: первый неиспользованный.
 pub fn next_color(layers: &[Layer]) -> usize {
-    let used: Vec<usize> = layers.iter().map(|l| l.color % PALETTE.len()).collect();
-    pick_color(&used, PALETTE.len(), layers.len())
+    let used: Vec<usize> = layers
+        .iter()
+        .filter(|l| !l.is_borders())
+        .map(|l| l.color % PALETTE.len())
+        .collect();
+    // Из свободных берём цвет, наименее похожий на уже занятые (иначе рядом с оранжевым
+    // слоем новый получал бы красный, который в палитре стоит следующим по порядку)
+    let free = (0..PALETTE.len()).filter(|i| !used.contains(i));
+    let distance = |a: Color32, b: Color32| {
+        // «Взвешенное» расстояние между цветами: глаз сильнее различает зелёный
+        let (dr, dg, db) = (
+            a.r() as f32 - b.r() as f32,
+            a.g() as f32 - b.g() as f32,
+            a.b() as f32 - b.b() as f32,
+        );
+        let rm = (a.r() as f32 + b.r() as f32) / 2.0;
+        ((2.0 + rm / 256.0) * dr * dr + 4.0 * dg * dg + (2.0 + (255.0 - rm) / 256.0) * db * db)
+            .sqrt()
+    };
+    let nearest = |i: usize| {
+        used.iter()
+            .map(|&u| distance(PALETTE[i], PALETTE[u]))
+            .fold(f32::MAX, f32::min)
+    };
+    free.max_by(|&a, &b| {
+        nearest(a)
+            .partial_cmp(&nearest(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // при равенстве - цвет с меньшим номером
+            .then(b.cmp(&a))
+    })
+    .unwrap_or_else(|| pick_color(&used, PALETTE.len(), layers.len()))
 }
 
 // ---------------------------------------------------------------------------

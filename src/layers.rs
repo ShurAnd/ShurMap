@@ -760,12 +760,77 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
     }
 }
 
+/// Значок и раздел по содержимому объекта: поля «industrial» (тип объекта),
+/// которое есть в слоях, подготовленных скриптами ShurMap.
+fn content_hint(props: &serde_json::Map<String, serde_json::Value>) -> Option<(Icon, Category)> {
+    use Category::{Industry, Mining, Power, Transport};
+    let text = |k: &str| prop_text(props, k).map(|t| t.to_lowercase());
+    let kind = text("industrial");
+    let has = |t: &Option<String>, keys: &[&str]| {
+        t.as_deref()
+            .is_some_and(|t| keys.iter().any(|k| t.contains(k)))
+    };
+    if kind.is_some() {
+        let k = &kind;
+        let hit = if has(k, &["золотой рудник"]) {
+            (Icon::GoldMine, Mining)
+        } else if has(k, &["медный рудник"]) {
+            (Icon::CopperMine, Mining)
+        } else if has(k, &["железорудн"]) {
+            (Icon::IronMine, Mining)
+        } else if has(k, &["угольная шахта", "угольный разрез"]) {
+            (Icon::CoalMine, Mining)
+        } else if has(k, &["угольный терминал"]) {
+            (Icon::CoalTerminal, Industry)
+        } else if has(k, &["аэропорт", "аэродром"]) {
+            (Icon::Airport, Transport)
+        } else if has(k, &["порт"]) {
+            (Icon::Port, Transport)
+        } else if has(k, &["цемент", "помольный"]) {
+            (Icon::Plant, Industry)
+        } else if has(k, &["аммиак", "метанол"]) {
+            (Icon::ChemN, Industry)
+        } else if has(k, &["нефтехими"]) {
+            (Icon::ChemPet, Industry)
+        } else if has(k, &["электрометаллург", "прямого восстановления"])
+        {
+            (Icon::SteelEaf, Industry)
+        } else if has(k, &["интегрированный комбинат", "металлургический"])
+        {
+            (Icon::SteelBf, Industry)
+        } else if has(k, &["солнечная"]) {
+            (Icon::Solar, Power)
+        } else if has(k, &["ветровая"]) {
+            (Icon::Wind, Power)
+        } else if has(k, &["плотинная", "русловая", "гидроаккумул"]) {
+            (Icon::Hydro, Power)
+        } else if has(k, &["угольная"]) {
+            (Icon::Coal, Power)
+        } else if has(k, &["тэс", "тэц"]) {
+            (Icon::Thermal, Power)
+        } else if has(k, &["refinery"]) {
+            (Icon::Refinery, Industry)
+        } else {
+            return None;
+        };
+        return Some(hit);
+    }
+    // Месторождения нефти и газа по полю «Fuel» не различить (бывает «нефть и газ»):
+    // для них значок и раздел берутся по имени файла.
+    None
+}
+
+/// Сколько первых объектов слоя просматривается при выборе значка по содержимому.
+const HINT_SAMPLE: usize = 200;
+
 pub struct Data {
     lines: Vec<Line>,
     dots: Vec<Dot>,
     labels: Vec<Label>,
     /// Сколько объектов файла попало на карту
     pub objects: usize,
+    /// Значок и раздел, подобранные по содержимому (если признаки нашлись)
+    pub hint: Option<(Icon, Category)>,
 }
 
 fn load(path: &Path) -> Result<Data, String> {
@@ -785,8 +850,19 @@ fn parse(bytes: &[u8]) -> Result<Data, String> {
     let mut dots: Vec<Dot> = Vec::new();
     let mut labels: Vec<Label> = Vec::new();
     let mut objects = 0;
+    let mut tally: Vec<((Icon, Category), usize)> = Vec::new();
+    let mut sampled = 0;
 
     for feature in file.features {
+        if sampled < HINT_SAMPLE {
+            sampled += 1;
+            if let Some(h) = feature.properties.as_ref().and_then(content_hint) {
+                match tally.iter_mut().find(|(k, _)| *k == h) {
+                    Some(entry) => entry.1 += 1,
+                    None => tally.push((h, 1)),
+                }
+            }
+        }
         let status = feature
             .properties
             .as_ref()
@@ -827,11 +903,18 @@ fn parse(bytes: &[u8]) -> Result<Data, String> {
     // Бледные рисуются первыми, обычные — сверху
     lines.sort_by_key(|l| !l.faded);
     dots.sort_by_key(|d| !d.faded);
+    // Значок по содержимому берём, если он у большинства просмотренных объектов
+    let hint = tally
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .filter(|(_, n)| *n * 2 > sampled)
+        .map(|(k, _)| k);
     Ok(Data {
         lines,
         dots,
         labels,
         objects,
+        hint,
     })
 }
 
@@ -870,11 +953,9 @@ pub fn guess_icon(path: &Path) -> Icon {
     } else if has(&["iron", "желез"]) && has(&["ore", "mine", "руд", "шахт", "рудник", "карьер"])
     {
         Icon::IronMine
-    } else if has(&["gold", "золот"]) && has(&["mine", "ore", "руд", "шахт", "рудник"])
-    {
+    } else if has(&["gold", "золот"]) {
         Icon::GoldMine
-    } else if has(&["copper", "медн", "медь"]) && has(&["mine", "ore", "руд", "шахт", "рудник"])
-    {
+    } else if has(&["copper", "медн", "медь"]) {
         Icon::CopperMine
     } else if has(&["chem", "хим"]) {
         if has(&[
@@ -1028,6 +1109,8 @@ pub struct Layer {
     pub category: Category,
     /// Данные, вшитые в программу (тогда файл не читается)
     builtin: Option<&'static [u8]>,
+    /// Значок и раздел по содержимому уже подбирались
+    hinted: bool,
     state: State,
 }
 
@@ -1042,6 +1125,7 @@ impl Layer {
             icon,
             category,
             builtin: None,
+            hinted: false,
             state: State::Idle,
         }
     }
@@ -1055,6 +1139,7 @@ impl Layer {
             icon: Icon::Dot,
             category: Category::Other,
             builtin: Some(bytes),
+            hinted: true,
             state: State::Idle,
         }
     }
@@ -1124,6 +1209,28 @@ impl Layer {
                     self.state = State::Failed("Загрузка слоя неожиданно прервалась".to_string())
                 }
             }
+        }
+        self.apply_hint();
+    }
+
+    /// Когда данные загрузились, подбирает значок и раздел по содержимому. Выбор пользователя
+    /// не трогается: меняются только значения «по имени файла» и «не задано» (точка, «Прочее»).
+    fn apply_hint(&mut self) {
+        if self.hinted {
+            return;
+        }
+        let Some(hint) = self.data().map(|d| d.hint) else {
+            return;
+        };
+        self.hinted = true;
+        let Some((icon, category)) = hint else {
+            return;
+        };
+        if self.icon == guess_icon(&self.path) || self.icon == Icon::Dot {
+            self.icon = icon;
+        }
+        if self.category == categories::guess(&self.path) || self.category == Category::Other {
+            self.category = category;
         }
     }
 
@@ -1427,6 +1534,8 @@ mod icon_tests {
         assert_eq!(g("Ветровые электростанции.geojson"), Icon::Wind);
         assert_eq!(g("cement_plants.geojson"), Icon::Plant);
         assert_eq!(g("Цементные заводы.geojson"), Icon::Plant);
+        assert_eq!(g("Золото.geojson"), Icon::GoldMine);
+        assert_eq!(g("Медь.geojson"), Icon::CopperMine);
         assert_eq!(g("gold_mines.geojson"), Icon::GoldMine);
         assert_eq!(g("Золотые рудники.geojson"), Icon::GoldMine);
         assert_eq!(g("copper_mines.geojson"), Icon::CopperMine);
@@ -1450,5 +1559,54 @@ mod icon_tests {
         assert_eq!(g("ports.geojson"), Icon::Port);
         assert_eq!(g("transport.geojson"), Icon::Dot);
         assert_eq!(g("pipelines.geojson"), Icon::Dot);
+    }
+
+    fn hint(json: &str) -> Option<(Icon, Category)> {
+        parse(json.as_bytes()).unwrap().hint
+    }
+
+    fn point(props: &str) -> String {
+        format!(
+            r#"{{"type":"Feature","properties":{props},"geometry":{{"type":"Point","coordinates":[10.0,50.0]}}}}"#
+        )
+    }
+
+    fn collection(features: &[String]) -> String {
+        format!(
+            r#"{{"type":"FeatureCollection","features":[{}]}}"#,
+            features.join(",")
+        )
+    }
+
+    #[test]
+    fn hint_by_content() {
+        let gold = point(
+            r#"{"Name":"A","Status":"operating","industrial":"Золотой рудник","Fuel":"золото"}"#,
+        );
+        assert_eq!(
+            hint(&collection(&[gold.clone(), gold])),
+            Some((Icon::GoldMine, Category::Mining))
+        );
+        let cu = point(
+            r#"{"Name":"A","Status":"operating","industrial":"Медный рудник","Fuel":"медь"}"#,
+        );
+        assert_eq!(
+            hint(&collection(&[cu])),
+            Some((Icon::CopperMine, Category::Mining))
+        );
+        let wind = point(
+            r#"{"Name":"A","Status":"operating","industrial":"Ветровая электростанция (береговая)"}"#,
+        );
+        assert_eq!(
+            hint(&collection(&[wind])),
+            Some((Icon::Wind, Category::Power))
+        );
+        // Чужой файл без признаков: подсказки нет
+        let other = point(r#"{"Name":"A","Status":"operating"}"#);
+        assert_eq!(hint(&collection(&[other])), None);
+        // Смесь без явного большинства: подсказки нет
+        let a = point(r#"{"Name":"A","industrial":"Золотой рудник"}"#);
+        let b = point(r#"{"Name":"B","industrial":"Медный рудник"}"#);
+        assert_eq!(hint(&collection(&[a, b])), None);
     }
 }

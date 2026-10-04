@@ -1,6 +1,8 @@
 // Скрывает окно консоли в релизной сборке под Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod countries;
+mod icons;
 mod layers;
 mod settings;
 
@@ -162,6 +164,87 @@ fn cover_world_px(bounds: [f64; 4], size: (f32, f32)) -> f64 {
 // ---------------------------------------------------------------------------
 // Кнопки масштаба (+ / −)
 // ---------------------------------------------------------------------------
+
+/// Кнопка фильтра по странам: воронка. Когда фильтр включён, воронка синяя, с числом стран.
+/// Возвращает (нажата ли, область кнопки).
+fn filter_button(ui: &mut egui::Ui, active: usize) -> (bool, egui::Rect) {
+    let size = 48.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let response = response.on_hover_text(if active > 0 {
+        "Фильтр по странам (включён)"
+    } else {
+        "Фильтр по странам"
+    });
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect.translate(egui::vec2(0.0, 3.0)).expand(2.0),
+        16.0,
+        egui::Color32::from_black_alpha(35),
+    );
+    painter.rect_filled(rect, 14.0, egui::Color32::from_white_alpha(240));
+
+    let blue = egui::Color32::from_rgb(26, 115, 232);
+    let color = if active > 0 || response.hovered() {
+        blue
+    } else {
+        egui::Color32::from_rgb(60, 64, 67)
+    };
+    let stroke = egui::Stroke::new(
+        if response.is_pointer_button_down_on() {
+            3.0
+        } else {
+            2.5
+        },
+        color,
+    );
+
+    // Воронка: широкий верх, сужение и короткая ножка
+    let c = rect.center() + egui::vec2(0.0, 1.0);
+    let p = |x: f32, y: f32| c + egui::vec2(x, y);
+    if active > 0 {
+        let fill = egui::Color32::from_rgba_unmultiplied(26, 115, 232, 70);
+        painter.add(egui::Shape::convex_polygon(
+            vec![p(-11.0, -9.0), p(11.0, -9.0), p(2.5, 1.0), p(-2.5, 1.0)],
+            fill,
+            egui::Stroke::NONE,
+        ));
+        painter.rect_filled(
+            egui::Rect::from_two_pos(p(-2.5, 1.0), p(2.5, 8.0)),
+            0.0,
+            fill,
+        );
+    }
+    painter.add(egui::Shape::closed_line(
+        vec![
+            p(-11.0, -9.0),
+            p(11.0, -9.0),
+            p(2.5, 1.0),
+            p(2.5, 9.0),
+            p(-2.5, 6.0),
+            p(-2.5, 1.0),
+        ],
+        stroke,
+    ));
+
+    // Число отмеченных стран в кружке справа вверху
+    if active > 0 {
+        let at = rect.right_top() + egui::vec2(-4.0, 4.0);
+        painter.circle_filled(at, 9.0, blue);
+        painter.text(
+            at,
+            egui::Align2::CENTER_CENTER,
+            active.min(99).to_string(),
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    (response.clicked(), rect)
+}
 
 /// Кнопка полноэкранного режима: четыре уголка наружу (включить) или внутрь (выйти).
 fn fullscreen_button(ui: &mut egui::Ui, is_full: bool) -> bool {
@@ -400,15 +483,17 @@ fn trash_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
-/// Окошко выбора цвета слоя. Возвращает выбранный номер цвета и занятую окошком область.
+/// Окошко выбора цвета и значка слоя. Возвращает выбранный номер цвета, выбранный значок
+/// и занятую окошком область.
 fn color_picker(
     ctx: &egui::Context,
     anchor: egui::Pos2,
     layers: &[layers::Layer],
     current: usize,
-) -> (Option<usize>, egui::Rect) {
+) -> (Option<usize>, Option<icons::Icon>, egui::Rect) {
     let n = layers::palette_len();
     let mut chosen = None;
+    let mut chosen_icon = None;
     let dark = egui::Color32::from_rgb(40, 40, 40);
     let shown = egui::Area::new(egui::Id::new("color_picker"))
         .order(egui::Order::Foreground)
@@ -459,9 +544,157 @@ fn color_picker(
                             }
                         }
                     });
+
+                // Значки для точек слоя (у слоёв из одних линий их нет)
+                if layers[current].has_dots() {
+                    ui.add_space(4.0);
+                    ui.small("Значок");
+                    let color = layers[current].display_color();
+                    egui::Grid::new("icon_grid")
+                        .spacing(egui::vec2(6.0, 6.0))
+                        .show(ui, |ui| {
+                            for (k, icon) in icons::ALL.iter().copied().enumerate() {
+                                let (rect, r) = ui.allocate_exact_size(
+                                    egui::vec2(28.0, 28.0),
+                                    egui::Sense::click(),
+                                );
+                                if icon == layers[current].icon {
+                                    ui.painter().circle_filled(rect.center(), 15.5, dark);
+                                }
+                                layers::paint_icon(ui.painter(), rect.center(), 12.0, icon, color);
+                                let r = r
+                                    .on_hover_text(icon.title())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if r.clicked() {
+                                    chosen_icon = Some(icon);
+                                }
+                                if k % 5 == 4 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                }
             });
         });
-    (chosen, shown.response.rect)
+    (chosen, chosen_icon, shown.response.rect)
+}
+
+/// Панель фильтра по странам. Возвращает true, если отметки изменились.
+fn filter_panel(ui: &mut egui::Ui, filter: &mut countries::Filter, search: &mut String) -> bool {
+    let list = &countries::get().list;
+    let mut changed = false;
+    ui.set_width(310.0);
+    ui.horizontal(|ui| {
+        ui.strong("Фильтр по странам");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(filter.is_active(), egui::Button::new("Сбросить"))
+                .clicked()
+            {
+                filter.checked.clear();
+                changed = true;
+            }
+        });
+    });
+    ui.small(if filter.is_active() {
+        "Показаны только объекты отмеченных стран"
+    } else {
+        "Ничего не отмечено — показаны все объекты"
+    });
+    ui.separator();
+
+    // Континенты: отметка включает или выключает все страны континента
+    for (c, name) in countries::CONTINENTS.iter().enumerate() {
+        let members: Vec<&countries::Country> = list
+            .iter()
+            .filter(|k| k.continent == c && !k.hidden)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let marked = members
+            .iter()
+            .filter(|k| filter.checked.contains(&k.code))
+            .count();
+        let mut all = marked == members.len();
+        let text = if marked > 0 && !all {
+            format!("{name} ({marked}/{})", members.len())
+        } else {
+            format!("{name} ({})", members.len())
+        };
+        if ui.checkbox(&mut all, text).changed() {
+            for k in &members {
+                if all {
+                    filter.checked.insert(k.code.clone());
+                } else {
+                    filter.checked.remove(&k.code);
+                }
+            }
+            changed = true;
+        }
+    }
+    ui.separator();
+
+    ui.add(
+        egui::TextEdit::singleline(search)
+            .hint_text("Поиск страны…")
+            .desired_width(f32::INFINITY),
+    );
+    let needle = countries::norm(search);
+    egui::ScrollArea::vertical()
+        .id_salt("filter_scroll")
+        .auto_shrink([false, false])
+        .min_scrolled_height(240.0)
+        .max_height(240.0)
+        .show(ui, |ui| {
+            // Общая строка «Россия»: отмечает или снимает обе части сразу
+            if needle.is_empty() || "россия".contains(&needle) {
+                let mut on = filter.checked.contains(countries::RUS_EU)
+                    && filter.checked.contains(countries::RUS_AS);
+                if ui.checkbox(&mut on, "Россия").changed() {
+                    for code in [countries::RUS_EU, countries::RUS_AS] {
+                        if on {
+                            filter.checked.insert(code.to_string());
+                        } else {
+                            filter.checked.remove(code);
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            for k in list.iter().filter(|k| {
+                !k.hidden && (needle.is_empty() || countries::norm(&k.ru).contains(&needle))
+            }) {
+                let mut on = filter.checked.contains(&k.code);
+                if ui.checkbox(&mut on, &k.ru).changed() {
+                    if on {
+                        filter.checked.insert(k.code.clone());
+                    } else {
+                        filter.checked.remove(&k.code);
+                    }
+                    changed = true;
+                }
+            }
+            if needle.is_empty() {
+                let mut on = filter.checked.contains(countries::UNKNOWN_CODE);
+                if ui
+                    .checkbox(&mut on, "Страна не определена")
+                    .on_hover_text("Объекты без страны в файле и вне границ (например, в море)")
+                    .changed()
+                {
+                    if on {
+                        filter.checked.insert(countries::UNKNOWN_CODE.to_string());
+                    } else {
+                        filter.checked.remove(countries::UNKNOWN_CODE);
+                    }
+                    changed = true;
+                }
+            }
+        });
+    if changed {
+        filter.rebuild();
+    }
+    changed
 }
 
 /// Что произошло в панели слоёв за кадр.
@@ -477,6 +710,7 @@ fn layers_panel(
     ui: &mut egui::Ui,
     layers: &mut [layers::Layer],
     collapsed: &mut bool,
+    use_icons: &mut bool,
 ) -> PanelResult {
     let mut result = PanelResult::default();
     ui.set_max_width(340.0);
@@ -486,10 +720,15 @@ fn layers_panel(
         } else {
             "Слои".to_string()
         };
-        ui.strong(title).on_hover_text(
+        let ms = ui
+            .ctx()
+            .data(|d| d.get_temp::<f32>(egui::Id::new(layers::MS_SHOWN_ID)))
+            .unwrap_or(0.0);
+        ui.strong(title).on_hover_text(format!(
             "Бледным цветом рисуются объекты со статусом «строится», «проект» или «простаивает».\n\
-             Отменённые и выведенные из эксплуатации объекты не показываются.",
-        );
+             Отменённые и выведенные из эксплуатации объекты не показываются.\n\n\
+             Подготовка слоёв в последнем кадре: {ms:.1} мс"
+        ));
         let label = if *collapsed {
             "Развернуть"
         } else {
@@ -502,6 +741,26 @@ fn layers_panel(
     if *collapsed {
         return result;
     }
+    ui.horizontal(|ui| {
+        if ui
+            .checkbox(use_icons, "Использовать значки")
+            .on_hover_text("Выключено: все точки рисуются простыми кружками")
+            .changed()
+        {
+            result.changed = true;
+        }
+        let any_on = layers.iter().any(|l| l.visible);
+        if ui
+            .add_enabled(any_on, egui::Button::new("Снять все"))
+            .on_hover_text("Выключить все слои (из списка они не удаляются)")
+            .clicked()
+        {
+            for layer in layers.iter_mut() {
+                layer.visible = false;
+            }
+            result.changed = true;
+        }
+    });
 
     // Строки слоёв. Короткий список рисуется как есть: высота подгоняется под содержимое.
     // Длинный (больше MAX_ROWS) прокручивается в окне фиксированной высоты. Автоподгонка
@@ -612,6 +871,12 @@ struct ViewerApp {
     color_picker: Option<(usize, egui::Rect)>,
     /// Панель слоёв свёрнута
     layers_collapsed: bool,
+    /// Общий фильтр по странам, окошко фильтра и строка поиска в нём
+    filter: countries::Filter,
+    filter_open: bool,
+    filter_search: String,
+    /// Рисовать точки значками (флаг в панели слоёв)
+    use_icons: bool,
     /// Вшитые в exe границы стран (российская версия, только суша); в списке слоёв не видны
     borders: layers::Layer,
 }
@@ -633,6 +898,10 @@ impl ViewerApp {
             layers: Vec::new(),
             color_picker: None,
             layers_collapsed: false,
+            filter: countries::Filter::default(),
+            filter_open: false,
+            filter_search: String::new(),
+            use_icons: true,
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
             )),
@@ -650,8 +919,11 @@ impl ViewerApp {
                     path: l.path.to_string_lossy().into_owned(),
                     visible: l.visible,
                     color: l.color,
+                    icon: Some(l.icon.key().to_string()),
                 })
                 .collect(),
+            filter: self.filter.codes(),
+            use_icons: self.use_icons,
         });
     }
 
@@ -703,6 +975,13 @@ impl ViewerApp {
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         mark_ready();
+        // Время, которое слои потратили в прошлом кадре (для подсказки в панели слоёв)
+        ui.ctx().data_mut(|d| {
+            let acc = egui::Id::new(layers::MS_ACC_ID);
+            let total = d.get_temp::<f32>(acc).unwrap_or(0.0);
+            d.insert_temp(egui::Id::new(layers::MS_SHOWN_ID), total);
+            d.insert_temp(acc, 0.0f32);
+        });
         // Фоновая загрузка слоёв: забираем готовое и запускаем чтение включённых слоёв
         self.borders.poll();
         self.borders.start_loading(ui.ctx());
@@ -731,7 +1010,7 @@ impl eframe::App for ViewerApp {
             self.boundaries_hidden = want_hidden;
         }
 
-        // Верхняя панель: две кнопки по центру
+        // Верхняя панель: кнопки по центру
         ui.vertical_centered(|ui| {
             centered_row(ui, "toolbar", |ui| {
                 if ui.button("Выбрать карту…").clicked() {
@@ -841,6 +1120,8 @@ impl eframe::App for ViewerApp {
                         borders: true,
                         layer_id: usize::MAX,
                         selected: None,
+                        filter: &self.filter,
+                        icon: icons::Icon::Dot,
                     });
                 }
                 for (index, layer) in self.layers.iter().enumerate() {
@@ -859,6 +1140,12 @@ impl eframe::App for ViewerApp {
                             borders: layer.is_borders(),
                             layer_id: index,
                             selected,
+                            filter: &self.filter,
+                            icon: if self.use_icons {
+                                layer.icon
+                            } else {
+                                icons::Icon::Dot
+                            },
                         });
                     }
                 }
@@ -955,6 +1242,23 @@ impl eframe::App for ViewerApp {
                         .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_full));
                 }
 
+                // Кнопка фильтра над кнопкой полноэкранного режима
+                let mut filter_rect = egui::Rect::NOTHING;
+                let mut filter_clicked = false;
+                let active = self.filter.checked.len();
+                egui::Area::new(egui::Id::new("filter_button"))
+                    .pivot(egui::Align2::RIGHT_BOTTOM)
+                    .fixed_pos(egui::pos2(
+                        map_rect.right() - 16.0,
+                        map_rect.center().y - 48.0 - 14.0 - 48.0 - 14.0,
+                    ))
+                    .show(ui.ctx(), |ui| {
+                        (filter_clicked, filter_rect) = filter_button(ui, active);
+                    });
+                if filter_clicked {
+                    self.filter_open = !self.filter_open;
+                }
+
                 // Кнопки + / − по центру правого края карты
                 let mut delta = 0.0;
                 egui::Area::new(egui::Id::new("zoom_buttons"))
@@ -974,8 +1278,12 @@ impl eframe::App for ViewerApp {
                         .fixed_pos(map_rect.left_top() + egui::vec2(12.0, 12.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                panel =
-                                    layers_panel(ui, &mut self.layers, &mut self.layers_collapsed);
+                                panel = layers_panel(
+                                    ui,
+                                    &mut self.layers,
+                                    &mut self.layers_collapsed,
+                                    &mut self.use_icons,
+                                );
                             });
                         });
 
@@ -1004,9 +1312,14 @@ impl eframe::App for ViewerApp {
                             self.color_picker = None;
                         } else {
                             let anchor = swatch.left_bottom() + egui::vec2(0.0, 6.0);
-                            let (chosen, area) = color_picker(ui.ctx(), anchor, &self.layers, i);
+                            let (chosen, chosen_icon, area) =
+                                color_picker(ui.ctx(), anchor, &self.layers, i);
                             if let Some(c) = chosen {
                                 layers::assign_color(&mut self.layers, i, c);
+                                self.color_picker = None;
+                                self.save_settings();
+                            } else if let Some(icon) = chosen_icon {
+                                self.layers[i].icon = icon;
                                 self.color_picker = None;
                                 self.save_settings();
                             } else if panel.color_click.is_none()
@@ -1016,6 +1329,37 @@ impl eframe::App for ViewerApp {
                                 if pos.is_some_and(|p| !area.contains(p) && !swatch.contains(p)) {
                                     self.color_picker = None;
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Окошко фильтра слева от кнопки фильтра
+                if self.filter_open {
+                    {
+                        let button = filter_rect;
+                        let mut changed = false;
+                        let area = egui::Area::new(egui::Id::new("filter_panel"))
+                            .order(egui::Order::Foreground)
+                            .pivot(egui::Align2::RIGHT_TOP)
+                            .fixed_pos(button.left_top() + egui::vec2(-8.0, 0.0))
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    changed =
+                                        filter_panel(ui, &mut self.filter, &mut self.filter_search);
+                                });
+                            });
+                        if changed {
+                            self.pinned = None;
+                            self.save_settings();
+                        }
+                        // Нажатие вне окошка и вне кнопки закрывает его
+                        if ui.ctx().input(|s| s.pointer.primary_pressed()) {
+                            let pos = ui.ctx().input(|s| s.pointer.interact_pos());
+                            if pos.is_some_and(|p| {
+                                !area.response.rect.contains(p) && !button.contains(p)
+                            }) {
+                                self.filter_open = false;
                             }
                         }
                     }
@@ -1224,10 +1568,18 @@ fn run_app() {
             app.layers = saved
                 .layers
                 .iter()
-                .map(|e| layers::Layer::new(PathBuf::from(&e.path), e.visible, e.color))
+                .map(|e| {
+                    let mut layer = layers::Layer::new(PathBuf::from(&e.path), e.visible, e.color);
+                    if let Some(icon) = e.icon.as_deref().and_then(icons::Icon::from_key) {
+                        layer.icon = icon;
+                    }
+                    layer
+                })
                 // Границы стран вшиты в программу: такой файл как отдельный слой не нужен
                 .filter(|l| !l.is_borders())
                 .collect();
+            app.filter = countries::Filter::from_codes(&saved.filter);
+            app.use_icons = saved.use_icons;
             if let Some(map) = saved.map.map(PathBuf::from).filter(|p| p.is_file()) {
                 app.open(map, cc.egui_ctx.clone());
             }

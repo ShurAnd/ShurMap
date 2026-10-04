@@ -17,14 +17,23 @@ pub struct LayerEntry {
     pub visible: bool,
     #[serde(default)]
     pub color: usize,
+    /// Значок точек (ключ из icons.rs); если не задан, подбирается по имени файла
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub map: Option<String>,
     #[serde(default)]
     pub layers: Vec<LayerEntry>,
+    /// Коды отмеченных стран общего фильтра (пусто — фильтра нет)
+    #[serde(default)]
+    pub filter: Vec<String>,
+    /// Рисовать точки значками (иначе простыми кружками)
+    #[serde(default = "yes")]
+    pub use_icons: bool,
 }
 
 /// Папка настроек, например C:\Users\you\AppData\Roaming\ShurMap
@@ -34,6 +43,17 @@ pub fn config_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     Some(base.join(APP_NAME))
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            map: None,
+            layers: Vec::new(),
+            filter: Vec::new(),
+            use_icons: true,
+        }
+    }
 }
 
 pub fn load() -> Settings {
@@ -54,6 +74,8 @@ pub fn load() -> Settings {
             return Settings {
                 map: Some(path.to_string()),
                 layers: Vec::new(),
+                filter: Vec::new(),
+                use_icons: true,
             };
         }
     }

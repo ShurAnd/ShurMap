@@ -2,6 +2,8 @@
 //! порты, станции) и контурами. Файл читается в фоновом потоке, маршруты упрощаются для
 //! нескольких масштабов, а рисуются слои поверх карты плагином walkers.
 
+use crate::countries::{self, Filter};
+use crate::icons::Icon;
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke};
 use serde::Deserialize;
 use std::{
@@ -463,6 +465,36 @@ fn add_line(faded: bool, label: u32, part: &[Pt], lines: &mut Vec<Line>) -> Resu
 }
 
 impl RawGeometry {
+    /// Первая и последняя точка геометрии (по ним определяется страна, если её нет в свойствах).
+    fn ends(&self) -> Vec<[f64; 2]> {
+        fn first_last(pts: &[Pt], out: &mut Vec<[f64; 2]>) {
+            if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+                out.push(a.0);
+                if pts.len() > 1 {
+                    out.push(b.0);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        match self {
+            RawGeometry::Point { coordinates } => out.push(coordinates.0),
+            RawGeometry::MultiPoint { coordinates } => first_last(coordinates, &mut out),
+            RawGeometry::LineString { coordinates } => first_last(coordinates, &mut out),
+            RawGeometry::MultiLineString { coordinates } | RawGeometry::Polygon { coordinates } => {
+                if let Some(part) = coordinates.first() {
+                    first_last(part, &mut out);
+                }
+            }
+            RawGeometry::MultiPolygon { coordinates } => {
+                if let Some(ring) = coordinates.first().and_then(|p| p.first()) {
+                    first_last(ring, &mut out);
+                }
+            }
+            RawGeometry::Other => {}
+        }
+        out
+    }
+
     /// Контуры полигонов рисуются линиями.
     fn collect(
         self,
@@ -501,6 +533,8 @@ impl RawGeometry {
 pub struct Label {
     pub title: String,
     pub details: Vec<String>,
+    /// Страны объекта (номера в таблице стран, см. countries.rs)
+    pub countries: Vec<u16>,
 }
 
 /// Результат наведения курсора на объект; плагины слоёв кладут его в память egui,
@@ -515,6 +549,16 @@ pub struct Hit {
     pub details: Vec<String>,
     pub color: Color32,
 }
+
+/// Свойства, в которых файл может хранить страну объекта.
+const COUNTRY_KEYS: [&str; 6] = [
+    "CountriesOrAreas",
+    "country",
+    "Country",
+    "COUNTRY",
+    "Страна",
+    "страна",
+];
 
 fn prop_text(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     let text = match props.get(key)? {
@@ -552,6 +596,7 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
         return Label {
             title: "Без названия".to_string(),
             details: Vec::new(),
+            countries: Vec::new(),
         };
     };
 
@@ -707,7 +752,11 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
         }
     }
 
-    Label { title, details }
+    Label {
+        title,
+        details,
+        countries: Vec::new(),
+    }
 }
 
 pub struct Data {
@@ -758,12 +807,19 @@ fn parse(bytes: &[u8]) -> Result<Data, String> {
             continue; // объект без геометрии (например, трубопровод без известного маршрута)
         };
 
+        let ends = geometry.ends();
         let (lines_before, dots_before) = (lines.len(), dots.len());
         let label = labels.len() as u32;
         geometry.collect(faded, label, &mut lines, &mut dots)?;
         if lines.len() > lines_before || dots.len() > dots_before {
             objects += 1;
-            labels.push(make_label(feature.properties.as_ref()));
+            let mut item = make_label(feature.properties.as_ref());
+            let property = feature
+                .properties
+                .as_ref()
+                .and_then(|p| COUNTRY_KEYS.iter().find_map(|k| prop_text(p, k)));
+            item.countries = countries::get().resolve(property.as_deref(), &ends);
+            labels.push(item);
         }
     }
 
@@ -789,11 +845,145 @@ enum State {
     Failed(String),
 }
 
+/// Значок по умолчанию по имени файла (его можно сменить в окошке цвета слоя).
+pub fn guess_icon(path: &Path) -> Icon {
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let words: Vec<&str> = name
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |keys: &[&str]| words.iter().any(|w| keys.iter().any(|k| w.contains(k)));
+    let is = |keys: &[&str]| words.iter().any(|w| keys.contains(w));
+    if has(&["airport", "аэропорт"]) || is(&["airports"]) {
+        Icon::Airport
+    } else if is(&["port", "ports", "seaport", "seaports"]) || has(&["порт"]) {
+        Icon::Port
+    } else if has(&["terminal", "lng", "storage", "терминал", "спг", "хранилищ"])
+    {
+        Icon::Tank
+    } else if has(&["refiner", "нпз", "нефтеперер"]) {
+        Icon::Refinery
+    } else if has(&["oil", "нефт"]) {
+        Icon::OilField
+    } else if has(&["gas", "газ"]) {
+        Icon::GasField
+    } else if has(&["nuclear", "аэс", "атом"]) {
+        Icon::Nuclear
+    } else if has(&["hydro", "гэс"]) {
+        Icon::Hydro
+    } else if has(&["coal", "уголь", "угол"]) {
+        Icon::Coal
+    } else if has(&["thermal", "тэс"]) {
+        Icon::Thermal
+    } else {
+        Icon::Dot
+    }
+}
+
+/// Рисует круглый значок слоя: цветной круг с белой окантовкой и белый рисунок.
+pub fn paint_icon(painter: &egui::Painter, center: Pos2, radius: f32, icon: Icon, fill: Color32) {
+    painter.circle(center, radius, fill, Stroke::new(1.0, Color32::WHITE));
+    let mut mesh = egui::Mesh::default();
+    add_glyph(&mut mesh, center, radius, icon);
+    if !mesh.is_empty() {
+        painter.add(Shape::mesh(mesh));
+    }
+}
+
+const DISK_SEGMENTS: usize = 10;
+
+fn unit_circle() -> &'static [(f32, f32); DISK_SEGMENTS] {
+    static TABLE: std::sync::OnceLock<[(f32, f32); DISK_SEGMENTS]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = [(0.0, 0.0); DISK_SEGMENTS];
+        for (i, v) in t.iter_mut().enumerate() {
+            let a = std::f32::consts::TAU * i as f32 / DISK_SEGMENTS as f32;
+            *v = (a.cos(), a.sin());
+        }
+        t
+    })
+}
+
+/// Добавляет в сетку закрашенный круг (веер треугольников).
+fn add_disk(mesh: &mut egui::Mesh, c: Pos2, r: f32, color: Color32) {
+    let base = mesh.vertices.len() as u32;
+    mesh.colored_vertex(c, color);
+    for &(cx, cy) in unit_circle() {
+        mesh.colored_vertex(Pos2::new(c.x + cx * r, c.y + cy * r), color);
+    }
+    let n = DISK_SEGMENTS as u32;
+    for i in 0..n {
+        mesh.add_triangle(base, base + 1 + i, base + 1 + (i + 1) % n);
+    }
+}
+
+/// Добавляет в сетку кольцо между радиусами `r_in` и `r_out`.
+fn add_ring(mesh: &mut egui::Mesh, c: Pos2, r_in: f32, r_out: f32, color: Color32) {
+    let base = mesh.vertices.len() as u32;
+    for &(cx, cy) in unit_circle() {
+        mesh.colored_vertex(Pos2::new(c.x + cx * r_in, c.y + cy * r_in), color);
+        mesh.colored_vertex(Pos2::new(c.x + cx * r_out, c.y + cy * r_out), color);
+    }
+    let n = DISK_SEGMENTS as u32;
+    for i in 0..n {
+        let (a, b) = (base + 2 * i, base + 2 * ((i + 1) % n));
+        mesh.add_triangle(a, a + 1, b);
+        mesh.add_triangle(a + 1, b + 1, b);
+    }
+}
+
+/// Оставляет по одной точке на клетку `cell` пикселей: на мелком масштабе тысячи точек
+/// сливаются в пятно, и рисовать каждую незачем. Точки в конце списка (обычные, не бледные)
+/// имеют приоритет. Точки за пределами `area` остаются как есть.
+fn thin(dots: Vec<(f32, f32, bool, u32)>, cell: f32, area: [f32; 4]) -> Vec<(f32, f32, bool, u32)> {
+    let cols = (((area[2] - area[0]) / cell).ceil() as usize).max(1) + 1;
+    let rows = (((area[3] - area[1]) / cell).ceil() as usize).max(1) + 1;
+    let mut taken = vec![false; cols * rows];
+    let mut kept: Vec<(f32, f32, bool, u32)> = Vec::with_capacity(dots.len().min(cols * rows));
+    for d in dots.into_iter().rev() {
+        let (cx, cy) = (
+            ((d.0 - area[0]) / cell).floor(),
+            ((d.1 - area[1]) / cell).floor(),
+        );
+        if cx >= 0.0 && cy >= 0.0 && (cx as usize) < cols && (cy as usize) < rows {
+            let slot = cy as usize * cols + cx as usize;
+            if taken[slot] {
+                continue;
+            }
+            taken[slot] = true;
+        }
+        kept.push(d);
+    }
+    kept.reverse();
+    kept
+}
+
+/// Добавляет в сетку белый рисунок значка.
+fn add_glyph(mesh: &mut egui::Mesh, center: Pos2, radius: f32, icon: Icon) {
+    let tris = icon.tris();
+    let scale = radius * 0.66;
+    let base = mesh.vertices.len() as u32;
+    for v in tris {
+        mesh.colored_vertex(
+            Pos2::new(center.x + v[0] * scale, center.y + v[1] * scale),
+            Color32::WHITE,
+        );
+    }
+    for k in 0..(tris.len() / 3) as u32 {
+        mesh.add_triangle(base + 3 * k, base + 3 * k + 1, base + 3 * k + 2);
+    }
+}
+
 pub struct Layer {
     pub path: PathBuf,
     pub visible: bool,
     /// Номер цвета в палитре (сохраняется в настройках)
     pub color: usize,
+    /// Значок точек слоя (сохраняется в настройках)
+    pub icon: Icon,
     /// Данные, вшитые в программу (тогда файл не читается)
     builtin: Option<&'static [u8]>,
     state: State,
@@ -801,10 +991,12 @@ pub struct Layer {
 
 impl Layer {
     pub fn new(path: PathBuf, visible: bool, color: usize) -> Self {
+        let icon = guess_icon(&path);
         Self {
             path,
             visible,
             color,
+            icon,
             builtin: None,
             state: State::Idle,
         }
@@ -816,6 +1008,7 @@ impl Layer {
             path: PathBuf::from("admin_0_builtin"),
             visible: true,
             color: 0,
+            icon: Icon::Dot,
             builtin: Some(bytes),
             state: State::Idle,
         }
@@ -825,6 +1018,11 @@ impl Layer {
     /// линией, а границы из самой карты на это время скрываются.
     pub fn is_borders(&self) -> bool {
         self.name().to_lowercase().contains("admin_0")
+    }
+
+    /// Есть ли в слое точки (значок нужен только им).
+    pub fn has_dots(&self) -> bool {
+        self.data().is_some_and(|d| !d.dots.is_empty())
     }
 
     /// Цвет слоя на карте и в панели.
@@ -926,7 +1124,19 @@ pub struct LayerPlugin<'a> {
     pub layer_id: usize,
     /// Объект этого слоя, по которому нажали: рисуется выделенным
     pub selected: Option<u32>,
+    /// Общий фильтр по странам (у слоя границ не применяется)
+    pub filter: &'a Filter,
+    /// Значок точек слоя
+    pub icon: Icon,
 }
+
+/// Ключи в памяти egui: время подготовки слоёв за кадр (накапливается / последнее значение).
+pub const MS_ACC_ID: &str = "layers_ms_acc";
+pub const MS_SHOWN_ID: &str = "layers_ms_shown";
+
+/// Если точек на экране больше, рисуются простые кружки (значки были бы слишком тяжёлыми).
+const ICON_LIMIT: usize = 1500;
+const ICON_RADIUS: f32 = 10.0;
 
 impl Plugin for LayerPlugin<'_> {
     fn run(
@@ -936,6 +1146,7 @@ impl Plugin for LayerPlugin<'_> {
         projector: &Projector,
         _map_memory: &MapMemory,
     ) {
+        let started = std::time::Instant::now();
         let rect = ui.max_rect();
         let Some(t) = Affine::fit(|lon, lat| {
             let v = projector.project(lon_lat(lon, lat));
@@ -973,8 +1184,26 @@ impl Plugin for LayerPlugin<'_> {
         let solid = self.color;
         let pale = Color32::from_rgba_unmultiplied(solid.r(), solid.g(), solid.b(), 110);
 
+        let filtering = !self.borders && self.filter.is_active();
+        // Какие объекты проходят фильтр: считается один раз за кадр
+        let pass: Vec<bool> = if filtering {
+            self.data
+                .labels
+                .iter()
+                .map(|l| self.filter.passes(&l.countries))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let shown = |label: u32| !filtering || pass.get(label as usize).copied().unwrap_or(false);
+
         for line in &self.data.lines {
-            if !line.overlaps(view) {
+            if !line.overlaps(view) || !shown(line.label) {
+                continue;
+            }
+            // Маршрут короче полутора пикселей не виден: не тратим на него время
+            if (line.max[0] - line.min[0]) * t.sx < 1.5 && (line.max[1] - line.min[1]) * t.sy < 1.5
+            {
                 continue;
             }
             let stroke = if self.borders {
@@ -997,26 +1226,47 @@ impl Plugin for LayerPlugin<'_> {
             });
         }
 
+        let mut visible: Vec<(f32, f32, bool, u32)> = Vec::new();
         for dot in &self.data.dots {
             let [x, y] = dot.pos;
-            if x < view[0] || x > view[2] || y < view[1] || y > view[3] {
+            if x < view[0] || x > view[2] || y < view[1] || y > view[3] || !shown(dot.label) {
                 continue;
             }
             let (sx, sy) = t.screen(&dot.pos);
-            let fill = if dot.faded { pale } else { solid };
-            painter.circle(
-                Pos2::new(sx, sy),
-                4.0,
-                fill,
-                Stroke::new(1.0, Color32::WHITE),
-            );
+            visible.push((sx, sy, dot.faded, dot.label));
+        }
+        let want_icons = !self.borders && self.icon != Icon::Dot;
+        let glyphs = want_icons && visible.len() <= ICON_LIMIT;
+        // Густые точки прореживаем: на экране всё равно видно только пятно
+        if glyphs {
+            if visible.len() > 250 {
+                visible = thin(visible, 2.0 * ICON_RADIUS, clip);
+            }
+        } else if visible.len() > 600 {
+            visible = thin(visible, 7.0, clip);
+        }
+        let radius = if glyphs { ICON_RADIUS } else { 4.0 };
+        let mut mesh = egui::Mesh::default();
+        for &(sx, sy, faded, label) in &visible {
+            let fill = if faded { pale } else { solid };
+            let center = Pos2::new(sx, sy);
+            add_ring(&mut mesh, center, radius, radius + 1.0, Color32::WHITE);
+            add_disk(&mut mesh, center, radius, fill);
+            if glyphs {
+                add_glyph(&mut mesh, center, radius, self.icon);
+            }
             if let Some(p) = pointer {
                 // Точки легче поймать, чем линии: вычитаем небольшой бонус
-                let d = ((p.x - sx).powi(2) + (p.y - sy).powi(2)).sqrt() - DOT_BONUS_PX;
+                let d = ((p.x - sx).powi(2) + (p.y - sy).powi(2)).sqrt()
+                    - DOT_BONUS_PX
+                    - (radius - 4.0);
                 if d <= reach && best.is_none_or(|b| d < b.0) {
-                    best = Some((d, dot.label));
+                    best = Some((d, label));
                 }
             }
+        }
+        if !mesh.is_empty() {
+            painter.add(Shape::mesh(mesh));
         }
 
         // Выбранный нажатием объект: белый ореол и более толстая линия поверх остальных
@@ -1040,10 +1290,15 @@ impl Plugin for LayerPlugin<'_> {
                 let (sx, sy) = t.screen(&dot.pos);
                 painter.circle(
                     Pos2::new(sx, sy),
-                    9.0,
+                    radius + 5.0,
                     solid,
                     Stroke::new(3.0, Color32::WHITE),
                 );
+                if glyphs {
+                    let mut m = egui::Mesh::default();
+                    add_glyph(&mut m, Pos2::new(sx, sy), radius + 5.0, self.icon);
+                    painter.add(Shape::mesh(m));
+                }
             }
         }
 
@@ -1068,6 +1323,14 @@ impl Plugin for LayerPlugin<'_> {
                 });
             }
         }
+
+        // Сколько времени ушло на подготовку слоёв (показывается в подсказке заголовка «Слои»)
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        ui.ctx().data_mut(|d| {
+            let id = egui::Id::new(MS_ACC_ID);
+            let total = d.get_temp::<f32>(id).unwrap_or(0.0) + ms;
+            d.insert_temp(id, total);
+        });
     }
 }
 
@@ -1094,5 +1357,30 @@ impl Plugin for FitProbe {
             ui.ctx()
                 .data_mut(|d| d.insert_temp(egui::Id::new(WORLD_PX_ID), world_px));
         }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    #[test]
+    fn guess() {
+        let g = |n: &str| guess_icon(Path::new(n));
+        assert_eq!(g("oil_fields.geojson"), Icon::OilField);
+        assert_eq!(g("gas_fields.geojson"), Icon::GasField);
+        assert_eq!(g("refineries_final.geojson"), Icon::Refinery);
+        assert_eq!(g("nuclear_plants.geojson"), Icon::Nuclear);
+        assert_eq!(g("hydro_plants.geojson"), Icon::Hydro);
+        assert_eq!(g("coal_plants.geojson"), Icon::Coal);
+        assert_eq!(g("thermal_plants.geojson"), Icon::Thermal);
+        assert_eq!(g("gas_terminals.geojson"), Icon::Tank);
+        assert_eq!(g("lng_terminals.geojson"), Icon::Tank);
+        assert_eq!(g("oil_storage.geojson"), Icon::Tank);
+        assert_eq!(g("airports.geojson"), Icon::Airport);
+        assert_eq!(g("seaports.geojson"), Icon::Port);
+        assert_eq!(g("ports.geojson"), Icon::Port);
+        assert_eq!(g("transport.geojson"), Icon::Dot);
+        assert_eq!(g("pipelines.geojson"), Icon::Dot);
     }
 }

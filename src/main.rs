@@ -1,6 +1,7 @@
 // Скрывает окно консоли в релизной сборке под Windows
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod categories;
 mod countries;
 mod icons;
 mod layers;
@@ -42,6 +43,47 @@ fn log_step(text: &str) {
 }
 
 /// Запущено ли приложение как дочерний процесс с выбранным графическим бэкендом (см. `supervise`).
+/// Найден ли жирный шрифт (см. `setup_fonts`).
+static BOLD_FONT: AtomicBool = AtomicBool::new(false);
+
+/// Подключает жирный шрифт из системных (стандартный шрифт egui жирного начертания не имеет).
+/// Если подходящего файла нет, заголовки выделяются цветом (`bold` вернёт `strong`).
+fn setup_fonts(ctx: &egui::Context) {
+    let candidates = [
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ];
+    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "bold".to_string(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    // Недостающие символы берутся из обычного шрифта
+    let mut chain = vec!["bold".to_string()];
+    if let Some(base) = fonts.families.get(&egui::FontFamily::Proportional) {
+        chain.extend(base.iter().cloned());
+    }
+    fonts
+        .families
+        .insert(egui::FontFamily::Name("bold".into()), chain);
+    ctx.set_fonts(fonts);
+    BOLD_FONT.store(true, Ordering::Relaxed);
+}
+
+/// Жирный текст (для заголовков разделов).
+fn bold(text: impl Into<String>) -> egui::RichText {
+    let text = egui::RichText::new(text);
+    if BOLD_FONT.load(Ordering::Relaxed) {
+        text.family(egui::FontFamily::Name("bold".into()))
+    } else {
+        text.strong()
+    }
+}
+
 static CHILD: AtomicBool = AtomicBool::new(false);
 /// Нарисован ли хотя бы один кадр: после этого сбой уже не связан с выбором бэкенда.
 static READY: AtomicBool = AtomicBool::new(false);
@@ -490,10 +532,16 @@ fn color_picker(
     anchor: egui::Pos2,
     layers: &[layers::Layer],
     current: usize,
-) -> (Option<usize>, Option<icons::Icon>, egui::Rect) {
+) -> (
+    Option<usize>,
+    Option<icons::Icon>,
+    Option<categories::Category>,
+    egui::Rect,
+) {
     let n = layers::palette_len();
     let mut chosen = None;
     let mut chosen_icon = None;
+    let mut chosen_category = None;
     let dark = egui::Color32::from_rgb(40, 40, 40);
     let shown = egui::Area::new(egui::Id::new("color_picker"))
         .order(egui::Order::Foreground)
@@ -574,9 +622,21 @@ fn color_picker(
                             }
                         });
                 }
+
+                // Раздел панели слоёв
+                ui.add_space(4.0);
+                ui.small("Раздел");
+                for cat in categories::ALL {
+                    if ui
+                        .selectable_label(layers[current].category == cat, cat.title())
+                        .clicked()
+                    {
+                        chosen_category = Some(cat);
+                    }
+                }
             });
         });
-    (chosen, chosen_icon, shown.response.rect)
+    (chosen, chosen_icon, chosen_category, shown.response.rect)
 }
 
 /// Панель фильтра по странам. Возвращает true, если отметки изменились.
@@ -587,12 +647,15 @@ fn filter_panel(ui: &mut egui::Ui, filter: &mut countries::Filter, search: &mut 
     ui.horizontal(|ui| {
         ui.strong("Фильтр по странам");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let can_reset = filter.is_active() || !search.is_empty();
             if ui
-                .add_enabled(filter.is_active(), egui::Button::new("Сбросить"))
+                .add_enabled(can_reset, egui::Button::new("Сбросить"))
+                .on_hover_text("Снять все отметки и очистить поиск")
                 .clicked()
             {
+                changed = filter.is_active();
                 filter.checked.clear();
-                changed = true;
+                search.clear();
             }
         });
     });
@@ -710,7 +773,7 @@ fn layers_panel(
     ui: &mut egui::Ui,
     layers: &mut [layers::Layer],
     collapsed: &mut bool,
-    use_icons: &mut bool,
+    closed: &mut [bool; 6],
 ) -> PanelResult {
     let mut result = PanelResult::default();
     ui.set_max_width(340.0);
@@ -742,13 +805,6 @@ fn layers_panel(
         return result;
     }
     ui.horizontal(|ui| {
-        if ui
-            .checkbox(use_icons, "Использовать значки")
-            .on_hover_text("Выключено: все точки рисуются простыми кружками")
-            .changed()
-        {
-            result.changed = true;
-        }
         let any_on = layers.iter().any(|l| l.visible);
         if ui
             .add_enabled(any_on, egui::Button::new("Снять все"))
@@ -769,58 +825,105 @@ fn layers_panel(
     const MAX_ROWS: usize = 15;
     let many = layers.len() > MAX_ROWS;
     let mut rows = |ui: &mut egui::Ui| {
-        for (i, layer) in layers.iter_mut().enumerate() {
+        for cat in categories::ALL {
+            let members: Vec<usize> = (0..layers.len())
+                .filter(|&i| layers[i].category == cat)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let c = cat as usize;
+            let on = members.iter().filter(|&&i| layers[i].visible).count();
             ui.horizontal(|ui| {
-                // Цвет слоя
-                let (rect, swatch) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-                ui.painter().rect_filled(rect, 3.0, layer.display_color());
-                if !layer.is_borders() {
-                    let swatch = swatch
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .on_hover_text("Изменить цвет слоя");
-                    if swatch.clicked() {
-                        result.color_click = Some((i, rect));
-                    }
+                let arrow = if closed[c] { "+" } else { "–" };
+                if ui.small_button(arrow).clicked() {
+                    closed[c] = !closed[c];
+                    result.changed = true;
                 }
-
-                // Кнопка слоя: нажата = слой включён
-                let hover = format!(
-                    "{}\n{}",
-                    layer.path.display(),
-                    layer
-                        .data()
-                        .map(|d| format!("Объектов на карте: {}", d.objects))
-                        .unwrap_or_default()
-                );
-                let mut visible = layer.visible;
-                ui.toggle_value(&mut visible, layers::short_name(&layer.name(), 28))
-                    .on_hover_text(hover);
-                if visible != layer.visible {
-                    layer.visible = visible;
-                    if visible {
-                        layer.retry_if_failed();
+                // Галочка раздела включает и выключает все его слои сразу
+                let mut all = on == members.len();
+                if ui
+                    .checkbox(&mut all, "")
+                    .on_hover_text("Включить или выключить все слои раздела")
+                    .changed()
+                {
+                    for &i in &members {
+                        layers[i].visible = all;
+                        if all {
+                            layers[i].retry_if_failed();
+                        }
                     }
                     result.changed = true;
                 }
-
-                if layer.is_loading() {
-                    ui.spinner();
-                }
-
-                if trash_button(ui)
-                    .on_hover_text("Убрать слой из списка")
+                let title = bold(format!("{} ({}/{})", cat.title(), on, members.len()));
+                if ui
+                    .add(egui::Label::new(title).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
-                    result.remove = Some(i);
+                    closed[c] = !closed[c];
+                    result.changed = true;
                 }
             });
+            if closed[c] {
+                continue;
+            }
+            for i in members {
+                let layer = &mut layers[i];
+                ui.horizontal(|ui| {
+                    // Цвет слоя
+                    let (rect, swatch) =
+                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 3.0, layer.display_color());
+                    if !layer.is_borders() {
+                        let swatch = swatch
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("Изменить цвет слоя");
+                        if swatch.clicked() {
+                            result.color_click = Some((i, rect));
+                        }
+                    }
 
-            if layer.visible {
-                if let Some(message) = layer.error() {
-                    ui.colored_label(egui::Color32::from_rgb(200, 50, 50), message);
-                } else if layer.data().is_some_and(|d| d.objects == 0) {
-                    ui.small("В файле нет объектов для показа (нужны линии, точки или контуры).");
+                    // Кнопка слоя: нажата = слой включён
+                    let hover = format!(
+                        "{}\n{}",
+                        layer.path.display(),
+                        layer
+                            .data()
+                            .map(|d| format!("Объектов на карте: {}", d.objects))
+                            .unwrap_or_default()
+                    );
+                    let mut visible = layer.visible;
+                    ui.toggle_value(&mut visible, layers::short_name(&layer.name(), 28))
+                        .on_hover_text(hover);
+                    if visible != layer.visible {
+                        layer.visible = visible;
+                        if visible {
+                            layer.retry_if_failed();
+                        }
+                        result.changed = true;
+                    }
+
+                    if layer.is_loading() {
+                        ui.spinner();
+                    }
+
+                    if trash_button(ui)
+                        .on_hover_text("Убрать слой из списка")
+                        .clicked()
+                    {
+                        result.remove = Some(i);
+                    }
+                });
+
+                if layer.visible {
+                    if let Some(message) = layer.error() {
+                        ui.colored_label(egui::Color32::from_rgb(200, 50, 50), message);
+                    } else if layer.data().is_some_and(|d| d.objects == 0) {
+                        ui.small(
+                            "В файле нет объектов для показа (нужны линии, точки или контуры).",
+                        );
+                    }
                 }
             }
         }
@@ -876,7 +979,8 @@ struct ViewerApp {
     filter_open: bool,
     filter_search: String,
     /// Рисовать точки значками (флаг в панели слоёв)
-    use_icons: bool,
+    /// Свёрнутые разделы панели слоёв (по номеру категории)
+    closed: [bool; 6],
     /// Вшитые в exe границы стран (российская версия, только суша); в списке слоёв не видны
     borders: layers::Layer,
 }
@@ -901,7 +1005,7 @@ impl ViewerApp {
             filter: countries::Filter::default(),
             filter_open: false,
             filter_search: String::new(),
-            use_icons: true,
+            closed: [false; 6],
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
             )),
@@ -920,10 +1024,15 @@ impl ViewerApp {
                     visible: l.visible,
                     color: l.color,
                     icon: Some(l.icon.key().to_string()),
+                    category: Some(l.category.key().to_string()),
                 })
                 .collect(),
             filter: self.filter.codes(),
-            use_icons: self.use_icons,
+            closed_categories: categories::ALL
+                .iter()
+                .filter(|c| self.closed[**c as usize])
+                .map(|c| c.key().to_string())
+                .collect(),
         });
     }
 
@@ -1141,11 +1250,7 @@ impl eframe::App for ViewerApp {
                             layer_id: index,
                             selected,
                             filter: &self.filter,
-                            icon: if self.use_icons {
-                                layer.icon
-                            } else {
-                                icons::Icon::Dot
-                            },
+                            icon: layer.icon,
                         });
                     }
                 }
@@ -1282,7 +1387,7 @@ impl eframe::App for ViewerApp {
                                     ui,
                                     &mut self.layers,
                                     &mut self.layers_collapsed,
-                                    &mut self.use_icons,
+                                    &mut self.closed,
                                 );
                             });
                         });
@@ -1312,7 +1417,7 @@ impl eframe::App for ViewerApp {
                             self.color_picker = None;
                         } else {
                             let anchor = swatch.left_bottom() + egui::vec2(0.0, 6.0);
-                            let (chosen, chosen_icon, area) =
+                            let (chosen, chosen_icon, chosen_category, area) =
                                 color_picker(ui.ctx(), anchor, &self.layers, i);
                             if let Some(c) = chosen {
                                 layers::assign_color(&mut self.layers, i, c);
@@ -1320,6 +1425,10 @@ impl eframe::App for ViewerApp {
                                 self.save_settings();
                             } else if let Some(icon) = chosen_icon {
                                 self.layers[i].icon = icon;
+                                self.color_picker = None;
+                                self.save_settings();
+                            } else if let Some(cat) = chosen_category {
+                                self.layers[i].category = cat;
                                 self.color_picker = None;
                                 self.save_settings();
                             } else if panel.color_click.is_none()
@@ -1561,6 +1670,7 @@ fn run_app() {
             walkers::install_renderer(cc.wgpu_render_state.as_ref());
             log_step("walkers renderer installed");
 
+            setup_fonts(&cc.egui_ctx);
             let saved = settings::load();
             let mut app = ViewerApp::new();
 
@@ -1573,13 +1683,22 @@ fn run_app() {
                     if let Some(icon) = e.icon.as_deref().and_then(icons::Icon::from_key) {
                         layer.icon = icon;
                     }
+                    if let Some(cat) = e
+                        .category
+                        .as_deref()
+                        .and_then(categories::Category::from_key)
+                    {
+                        layer.category = cat;
+                    }
                     layer
                 })
                 // Границы стран вшиты в программу: такой файл как отдельный слой не нужен
                 .filter(|l| !l.is_borders())
                 .collect();
             app.filter = countries::Filter::from_codes(&saved.filter);
-            app.use_icons = saved.use_icons;
+            for c in categories::ALL {
+                app.closed[c as usize] = saved.closed_categories.iter().any(|k| k == c.key());
+            }
             if let Some(map) = saved.map.map(PathBuf::from).filter(|p| p.is_file()) {
                 app.open(map, cc.egui_ctx.clone());
             }

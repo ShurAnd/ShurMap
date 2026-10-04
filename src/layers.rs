@@ -2,6 +2,7 @@
 //! порты, станции) и контурами. Файл читается в фоновом потоке, маршруты упрощаются для
 //! нескольких масштабов, а рисуются слои поверх карты плагином walkers.
 
+use crate::categories::{self, Category};
 use crate::countries::{self, Filter};
 use crate::icons::Icon;
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke};
@@ -861,6 +862,45 @@ pub fn guess_icon(path: &Path) -> Icon {
         Icon::Airport
     } else if is(&["port", "ports", "seaport", "seaports"]) || has(&["порт"]) {
         Icon::Port
+    } else if has(&["terminal", "терминал"]) && has(&["coal", "уголь", "угол"]) {
+        Icon::CoalTerminal
+    } else if has(&["mine", "mines", "шахт", "разрез"]) && has(&["coal", "уголь", "угол"])
+    {
+        Icon::CoalMine
+    } else if has(&["iron", "желез"]) && has(&["ore", "mine", "руд", "шахт", "рудник", "карьер"])
+    {
+        Icon::IronMine
+    } else if has(&["gold", "золот"]) && has(&["mine", "ore", "руд", "шахт", "рудник"])
+    {
+        Icon::GoldMine
+    } else if has(&["copper", "медн", "медь"]) && has(&["mine", "ore", "руд", "шахт", "рудник"])
+    {
+        Icon::CopperMine
+    } else if has(&["chem", "хим"]) {
+        if has(&[
+            "ammonia",
+            "methanol",
+            "аммиак",
+            "метанол",
+            "азот",
+            "nitrogen",
+        ]) {
+            Icon::ChemN
+        } else {
+            Icon::ChemPet
+        }
+    } else if has(&["solar", "солнеч", "сэс"]) {
+        Icon::Solar
+    } else if has(&["wind", "ветр", "вэс"]) {
+        Icon::Wind
+    } else if has(&["cement", "цемент"]) {
+        Icon::Plant
+    } else if has(&["steel", "стал", "металлург"]) {
+        if has(&["electric", "eaf", "электро"]) {
+            Icon::SteelEaf
+        } else {
+            Icon::SteelBf
+        }
     } else if has(&["terminal", "lng", "storage", "терминал", "спг", "хранилищ"])
     {
         Icon::Tank
@@ -984,6 +1024,8 @@ pub struct Layer {
     pub color: usize,
     /// Значок точек слоя (сохраняется в настройках)
     pub icon: Icon,
+    /// Раздел панели слоёв (сохраняется в настройках)
+    pub category: Category,
     /// Данные, вшитые в программу (тогда файл не читается)
     builtin: Option<&'static [u8]>,
     state: State,
@@ -992,11 +1034,13 @@ pub struct Layer {
 impl Layer {
     pub fn new(path: PathBuf, visible: bool, color: usize) -> Self {
         let icon = guess_icon(&path);
+        let category = categories::guess(&path);
         Self {
             path,
             visible,
             color,
             icon,
+            category,
             builtin: None,
             state: State::Idle,
         }
@@ -1009,6 +1053,7 @@ impl Layer {
             visible: true,
             color: 0,
             icon: Icon::Dot,
+            category: Category::Other,
             builtin: Some(bytes),
             state: State::Idle,
         }
@@ -1374,6 +1419,29 @@ mod icon_tests {
         assert_eq!(g("hydro_plants.geojson"), Icon::Hydro);
         assert_eq!(g("coal_plants.geojson"), Icon::Coal);
         assert_eq!(g("thermal_plants.geojson"), Icon::Thermal);
+        assert_eq!(g("coal_mines.geojson"), Icon::CoalMine);
+        assert_eq!(g("coal_terminals.geojson"), Icon::CoalTerminal);
+        assert_eq!(g("solar_plants.geojson"), Icon::Solar);
+        assert_eq!(g("wind_plants.geojson"), Icon::Wind);
+        assert_eq!(g("Солнечные электростанции.geojson"), Icon::Solar);
+        assert_eq!(g("Ветровые электростанции.geojson"), Icon::Wind);
+        assert_eq!(g("cement_plants.geojson"), Icon::Plant);
+        assert_eq!(g("Цементные заводы.geojson"), Icon::Plant);
+        assert_eq!(g("gold_mines.geojson"), Icon::GoldMine);
+        assert_eq!(g("Золотые рудники.geojson"), Icon::GoldMine);
+        assert_eq!(g("copper_mines.geojson"), Icon::CopperMine);
+        assert_eq!(g("Медные рудники.geojson"), Icon::CopperMine);
+        assert_eq!(g("iron_ore_mines.geojson"), Icon::IronMine);
+        assert_eq!(g("Железорудные шахты.geojson"), Icon::IronMine);
+        assert_eq!(g("chemicals_ammonia.geojson"), Icon::ChemN);
+        assert_eq!(g("Химия - аммиак и метанол.geojson"), Icon::ChemN);
+        assert_eq!(g("Нефтехимия.geojson"), Icon::ChemPet);
+        assert_eq!(g("chemicals_petro.geojson"), Icon::ChemPet);
+        assert_eq!(g("steel_integrated.geojson"), Icon::SteelBf);
+        assert_eq!(g("steel_electric.geojson"), Icon::SteelEaf);
+        assert_eq!(g("Металлургические комбинаты.geojson"), Icon::SteelBf);
+        assert_eq!(g("Сталелитейные комбинаты.geojson"), Icon::SteelBf);
+        assert_eq!(g("Электросталеплавильные заводы.geojson"), Icon::SteelEaf);
         assert_eq!(g("gas_terminals.geojson"), Icon::Tank);
         assert_eq!(g("lng_terminals.geojson"), Icon::Tank);
         assert_eq!(g("oil_storage.geojson"), Icon::Tank);

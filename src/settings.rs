@@ -20,6 +20,9 @@ pub struct LayerEntry {
     /// Значок точек (ключ из icons.rs); если не задан, подбирается по имени файла
     #[serde(default)]
     pub icon: Option<String>,
+    /// Раздел панели слоёв (ключ из categories.rs); если не задан, подбирается по имени файла
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -31,9 +34,9 @@ pub struct Settings {
     /// Коды отмеченных стран общего фильтра (пусто — фильтра нет)
     #[serde(default)]
     pub filter: Vec<String>,
-    /// Рисовать точки значками (иначе простыми кружками)
-    #[serde(default = "yes")]
-    pub use_icons: bool,
+    /// Свёрнутые разделы панели слоёв (ключи из categories.rs)
+    #[serde(default)]
+    pub closed_categories: Vec<String>,
 }
 
 /// Папка настроек, например C:\Users\you\AppData\Roaming\ShurMap
@@ -51,7 +54,7 @@ impl Default for Settings {
             map: None,
             layers: Vec::new(),
             filter: Vec::new(),
-            use_icons: true,
+            closed_categories: Vec::new(),
         }
     }
 }
@@ -75,7 +78,7 @@ pub fn load() -> Settings {
                 map: Some(path.to_string()),
                 layers: Vec::new(),
                 filter: Vec::new(),
-                use_icons: true,
+                closed_categories: Vec::new(),
             };
         }
     }

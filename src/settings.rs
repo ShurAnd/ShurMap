@@ -17,12 +17,16 @@ pub struct LayerEntry {
     pub visible: bool,
     #[serde(default)]
     pub color: usize,
-    /// Значок точек (ключ из icons.rs); если не задан, подбирается по имени файла
+    /// Значок точек (ключ из icons.rs): запоминается, чтобы слой сразу рисовался правильно;
+    /// при загрузке слоя подбирается заново по его содержимому
     #[serde(default)]
     pub icon: Option<String>,
-    /// Раздел панели слоёв (ключ из categories.rs); если не задан, подбирается по имени файла
+    /// Раздел панели слоёв (ключ из categories.rs); если не задан, подбирается по содержимому
     #[serde(default)]
     pub category: Option<String>,
+    /// Раздел выбран пользователем (иначе он подбирается по содержимому слоя при загрузке)
+    #[serde(default)]
+    pub category_manual: bool,
 }
 
 #[derive(Serialize, Deserialize)]

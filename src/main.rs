@@ -5,7 +5,9 @@ mod categories;
 mod countries;
 mod icons;
 mod layers;
+mod raster;
 mod settings;
+mod strokes;
 
 use eframe::egui;
 use serde_json::{Value, json};
@@ -525,22 +527,16 @@ fn trash_button(ui: &mut egui::Ui) -> egui::Response {
     response
 }
 
-/// Окошко выбора цвета и значка слоя. Возвращает выбранный номер цвета, выбранный значок
+/// Окошко выбора цвета и раздела слоя. Возвращает выбранный номер цвета, выбранный раздел
 /// и занятую окошком область.
 fn color_picker(
     ctx: &egui::Context,
     anchor: egui::Pos2,
     layers: &[layers::Layer],
     current: usize,
-) -> (
-    Option<usize>,
-    Option<icons::Icon>,
-    Option<categories::Category>,
-    egui::Rect,
-) {
+) -> (Option<usize>, Option<categories::Category>, egui::Rect) {
     let n = layers::palette_len();
     let mut chosen = None;
-    let mut chosen_icon = None;
     let mut chosen_category = None;
     let dark = egui::Color32::from_rgb(40, 40, 40);
     let shown = egui::Area::new(egui::Id::new("color_picker"))
@@ -593,36 +589,6 @@ fn color_picker(
                         }
                     });
 
-                // Значки для точек слоя (у слоёв из одних линий их нет)
-                if layers[current].has_dots() {
-                    ui.add_space(4.0);
-                    ui.small("Значок");
-                    let color = layers[current].display_color();
-                    egui::Grid::new("icon_grid")
-                        .spacing(egui::vec2(6.0, 6.0))
-                        .show(ui, |ui| {
-                            for (k, icon) in icons::ALL.iter().copied().enumerate() {
-                                let (rect, r) = ui.allocate_exact_size(
-                                    egui::vec2(28.0, 28.0),
-                                    egui::Sense::click(),
-                                );
-                                if icon == layers[current].icon {
-                                    ui.painter().circle_filled(rect.center(), 15.5, dark);
-                                }
-                                layers::paint_icon(ui.painter(), rect.center(), 12.0, icon, color);
-                                let r = r
-                                    .on_hover_text(icon.title())
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if r.clicked() {
-                                    chosen_icon = Some(icon);
-                                }
-                                if k % 5 == 4 {
-                                    ui.end_row();
-                                }
-                            }
-                        });
-                }
-
                 // Раздел панели слоёв
                 ui.add_space(4.0);
                 ui.small("Раздел");
@@ -636,7 +602,7 @@ fn color_picker(
                 }
             });
         });
-    (chosen, chosen_icon, chosen_category, shown.response.rect)
+    (chosen, chosen_category, shown.response.rect)
 }
 
 /// Панель фильтра по странам. Возвращает true, если отметки изменились.
@@ -787,10 +753,22 @@ fn layers_panel(
             .ctx()
             .data(|d| d.get_temp::<f32>(egui::Id::new(layers::MS_SHOWN_ID)))
             .unwrap_or(0.0);
+        let parts = ui
+            .ctx()
+            .data(|d| d.get_temp::<[f32; 4]>(egui::Id::new(layers::PARTS_SHOWN_ID)))
+            .unwrap_or([0.0; 4]);
+        let frame_ms = ui
+            .ctx()
+            .data(|d| d.get_temp::<f32>(egui::Id::new("frame_ms_ema")))
+            .unwrap_or(0.0);
         ui.strong(title).on_hover_text(format!(
             "Бледным цветом рисуются объекты со статусом «строится», «проект» или «простаивает».\n\
              Отменённые и выведенные из эксплуатации объекты не показываются.\n\n\
-             Подготовка слоёв в последнем кадре: {ms:.1} мс"
+             Подготовка слоёв в последнем кадре: {ms:.1} мс\n\
+             • линии: {:.1} мс, точек линий {:.0}\n\
+             • точки и значки: {:.1} мс, на карте {:.0}\n\
+             Интервал между кадрами (среднее): {frame_ms:.1} мс",
+            parts[0], parts[2], parts[1], parts[3]
         ));
         let label = if *collapsed {
             "Развернуть"
@@ -872,9 +850,22 @@ fn layers_panel(
                 let layer = &mut layers[i];
                 ui.horizontal(|ui| {
                     // Цвет слоя
+                    // У слоёв из точек — значок слоя, у линейных — квадрат цвета
                     let (rect, swatch) =
-                        ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
-                    ui.painter().rect_filled(rect, 3.0, layer.display_color());
+                        ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                    if layer.shows_badge() {
+                        layers::paint_badge(
+                            ui,
+                            rect.center(),
+                            22.0,
+                            layer.icon,
+                            layer.display_color(),
+                        );
+                    } else {
+                        let square =
+                            egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0));
+                        ui.painter().rect_filled(square, 3.0, layer.display_color());
+                    }
                     if !layer.is_borders() {
                         let swatch = swatch
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1025,6 +1016,7 @@ impl ViewerApp {
                     color: l.color,
                     icon: Some(l.icon.key().to_string()),
                     category: Some(l.category.key().to_string()),
+                    category_manual: l.category_manual,
                 })
                 .collect(),
             filter: self.filter.codes(),
@@ -1090,15 +1082,30 @@ impl eframe::App for ViewerApp {
             let total = d.get_temp::<f32>(acc).unwrap_or(0.0);
             d.insert_temp(egui::Id::new(layers::MS_SHOWN_ID), total);
             d.insert_temp(acc, 0.0f32);
+            let parts_acc = egui::Id::new(layers::PARTS_ACC_ID);
+            let parts = d.get_temp::<[f32; 4]>(parts_acc).unwrap_or([0.0; 4]);
+            d.insert_temp(egui::Id::new(layers::PARTS_SHOWN_ID), parts);
+            d.insert_temp(parts_acc, [0.0f32; 4]);
         });
+        // Сглаженный интервал между кадрами: по нему видно, сколько на самом деле кадров в секунду
+        let dt = ui.ctx().input(|i| i.unstable_dt) * 1000.0;
+        let frame_id = egui::Id::new("frame_ms_ema");
+        let ema = ui.ctx().data(|d| d.get_temp::<f32>(frame_id));
+        let ema = ema.map_or(dt, |e| e * 0.9 + dt * 0.1);
+        ui.ctx().data_mut(|d| d.insert_temp(frame_id, ema));
         // Фоновая загрузка слоёв: забираем готовое и запускаем чтение включённых слоёв
         self.borders.poll();
         self.borders.start_loading(ui.ctx());
+        let mut hints_changed = false;
         for layer in &mut self.layers {
-            layer.poll();
+            hints_changed |= layer.poll();
             if layer.visible {
                 layer.start_loading(ui.ctx());
             }
+        }
+        if hints_changed {
+            // Значок и раздел подобрались по содержимому слоя: запоминаем их
+            self.save_settings();
         }
 
         // Пока включён и загружен слой границ стран, границы самой карты скрываем
@@ -1231,6 +1238,7 @@ impl eframe::App for ViewerApp {
                         selected: None,
                         filter: &self.filter,
                         icon: icons::Icon::Dot,
+                        dashed: false,
                     });
                 }
                 for (index, layer) in self.layers.iter().enumerate() {
@@ -1251,6 +1259,8 @@ impl eframe::App for ViewerApp {
                             selected,
                             filter: &self.filter,
                             icon: layer.icon,
+                            // Транспортные линии пунктиром, чтобы не сливались с трубопроводами
+                            dashed: layer.category == categories::Category::Transport,
                         });
                     }
                 }
@@ -1417,18 +1427,14 @@ impl eframe::App for ViewerApp {
                             self.color_picker = None;
                         } else {
                             let anchor = swatch.left_bottom() + egui::vec2(0.0, 6.0);
-                            let (chosen, chosen_icon, chosen_category, area) =
+                            let (chosen, chosen_category, area) =
                                 color_picker(ui.ctx(), anchor, &self.layers, i);
                             if let Some(c) = chosen {
                                 layers::assign_color(&mut self.layers, i, c);
                                 self.color_picker = None;
                                 self.save_settings();
-                            } else if let Some(icon) = chosen_icon {
-                                self.layers[i].icon = icon;
-                                self.color_picker = None;
-                                self.save_settings();
                             } else if let Some(cat) = chosen_category {
-                                self.layers[i].category = cat;
+                                self.layers[i].set_category(cat);
                                 self.color_picker = None;
                                 self.save_settings();
                             } else if panel.color_click.is_none()
@@ -1690,6 +1696,7 @@ fn run_app() {
                     {
                         layer.category = cat;
                     }
+                    layer.category_manual = e.category_manual;
                     layer
                 })
                 // Границы стран вшиты в программу: такой файл как отдельный слой не нужен

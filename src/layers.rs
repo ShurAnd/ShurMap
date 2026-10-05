@@ -2,9 +2,11 @@
 //! порты, станции) и контурами. Файл читается в фоновом потоке, маршруты упрощаются для
 //! нескольких масштабов, а рисуются слои поверх карты плагином walkers.
 
-use crate::categories::{self, Category};
+use crate::categories::Category;
 use crate::countries::{self, Filter};
 use crate::icons::Icon;
+use crate::raster::{self, Prim};
+use crate::strokes;
 use eframe::egui::{self, Color32, Pos2, Shape, Stroke};
 use serde::Deserialize;
 use std::{
@@ -224,7 +226,7 @@ pub fn visible_runs<P>(
     t: &Affine,
     clip: [f32; 4],
     make_point: impl Fn(f32, f32) -> P,
-    mut emit: impl FnMut(Vec<P>),
+    mut emit: impl FnMut(&[P]),
 ) {
     let mut run: Vec<P> = Vec::new();
     let mut prev: Option<(f32, f32)> = None;
@@ -241,13 +243,14 @@ pub fn visible_runs<P>(
                 }
                 run.push(make_point(cur.0, cur.1));
             } else if !run.is_empty() {
-                emit(std::mem::take(&mut run));
+                emit(&run);
+                run.clear();
             }
         }
         prev = Some(cur);
     }
     if run.len() >= 2 {
-        emit(run);
+        emit(&run);
     }
 }
 
@@ -656,7 +659,14 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
             .or_else(|| prop_text(props, "status"))
             .map(|s| status_ru(&s)),
     );
-    add("Топливо", prop_text(props, "Fuel"));
+    add("Ресурс", prop_text(props, "Ресурс"));
+    // У добывающих объектов (рудники, месторождения) старое поле «Fuel» — это ресурс, а не
+    // топливо; «Топливо» остаётся у электростанций
+    let fuel_name = match content_hint(props) {
+        Some((_, Category::Mining)) => "Ресурс",
+        _ => "Топливо",
+    };
+    add(fuel_name, prop_text(props, "Fuel"));
     add(
         "Владелец",
         prop_text(props, "Owner").or_else(|| prop_text(props, "owner")),
@@ -760,16 +770,31 @@ fn make_label(props: Option<&serde_json::Map<String, serde_json::Value>>) -> Lab
     }
 }
 
-/// Значок и раздел по содержимому объекта: поля «industrial» (тип объекта),
-/// которое есть в слоях, подготовленных скриптами ShurMap.
+/// Значок и раздел по содержимому объекта. Название файла не учитывается: смотрим только
+/// на поля. Признаки (по убыванию надёжности):
+///  * `PipelineName` (трубопроводы GEM) и `featurecla` «Railroad» (железные дороги Natural
+///    Earth) определяют раздел линейных слоёв;
+///  * `industrial` — тип объекта в слоях, подготовленных скриптами ShurMap (и «refinery» у НПЗ
+///    из OpenStreetMap);
+///  * `TerminalName` — терминалы GEM; `Reactor` — атомные станции GEM;
+///  * `Ресурс` или `Fuel` у объектов без `industrial` — месторождения нефти и газа.
 fn content_hint(props: &serde_json::Map<String, serde_json::Value>) -> Option<(Icon, Category)> {
-    use Category::{Industry, Mining, Power, Transport};
+    use Category::{Industry, Mining, Pipelines, Power, Transport};
     let text = |k: &str| prop_text(props, k).map(|t| t.to_lowercase());
-    let kind = text("industrial");
+    let has_key = |k: &str| props.get(k).is_some_and(|v| !v.is_null());
     let has = |t: &Option<String>, keys: &[&str]| {
         t.as_deref()
             .is_some_and(|t| keys.iter().any(|k| t.contains(k)))
     };
+
+    if has_key("PipelineName") {
+        return Some((Icon::Dot, Pipelines));
+    }
+    if has_key("rwdb_rr_id") || has(&text("featurecla"), &["railroad"]) {
+        return Some((Icon::Dot, Transport));
+    }
+
+    let kind = text("industrial");
     if kind.is_some() {
         let k = &kind;
         let hit = if has(k, &["золотой рудник"]) {
@@ -782,12 +807,12 @@ fn content_hint(props: &serde_json::Map<String, serde_json::Value>) -> Option<(I
             (Icon::CoalMine, Mining)
         } else if has(k, &["угольный терминал"]) {
             (Icon::CoalTerminal, Industry)
-        } else if has(k, &["аэропорт", "аэродром"]) {
+        } else if has(k, &["аэропорт", "аэродром", "космодром"]) {
             (Icon::Airport, Transport)
         } else if has(k, &["порт"]) {
             (Icon::Port, Transport)
         } else if has(k, &["цемент", "помольный"]) {
-            (Icon::Plant, Industry)
+            (Icon::Cement, Industry)
         } else if has(k, &["аммиак", "метанол"]) {
             (Icon::ChemN, Industry)
         } else if has(k, &["нефтехими"]) {
@@ -810,13 +835,31 @@ fn content_hint(props: &serde_json::Map<String, serde_json::Value>) -> Option<(I
             (Icon::Thermal, Power)
         } else if has(k, &["refinery"]) {
             (Icon::Refinery, Industry)
+        } else if has(k, &["oil_storage", "gas_storage"]) {
+            (Icon::Tank, Industry)
         } else {
             return None;
         };
         return Some(hit);
     }
-    // Месторождения нефти и газа по полю «Fuel» не различить (бывает «нефть и газ»):
-    // для них значок и раздел берутся по имени файла.
+
+    if has_key("TerminalName") {
+        return Some((Icon::Tank, Industry));
+    }
+    if has_key("Reactor") {
+        return Some((Icon::Nuclear, Power));
+    }
+
+    // Месторождения: «Нефть», «Газ», «Нефть и газ (преимущественно газ)» и т. п.
+    let resource = text("Ресурс").or_else(|| text("Fuel"));
+    if has(&resource, &["преимущественно газ"])
+        || resource.as_deref().is_some_and(|t| t.starts_with("газ"))
+    {
+        return Some((Icon::GasField, Mining));
+    }
+    if resource.as_deref().is_some_and(|t| t.starts_with("нефть")) {
+        return Some((Icon::OilField, Mining));
+    }
     None
 }
 
@@ -929,133 +972,6 @@ enum State {
     Failed(String),
 }
 
-/// Значок по умолчанию по имени файла (его можно сменить в окошке цвета слоя).
-pub fn guess_icon(path: &Path) -> Icon {
-    let name = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let words: Vec<&str> = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let has = |keys: &[&str]| words.iter().any(|w| keys.iter().any(|k| w.contains(k)));
-    let is = |keys: &[&str]| words.iter().any(|w| keys.contains(w));
-    if has(&["airport", "аэропорт"]) || is(&["airports"]) {
-        Icon::Airport
-    } else if is(&["port", "ports", "seaport", "seaports"]) || has(&["порт"]) {
-        Icon::Port
-    } else if has(&["terminal", "терминал"]) && has(&["coal", "уголь", "угол"]) {
-        Icon::CoalTerminal
-    } else if has(&["mine", "mines", "шахт", "разрез"]) && has(&["coal", "уголь", "угол"])
-    {
-        Icon::CoalMine
-    } else if has(&["iron", "желез"]) && has(&["ore", "mine", "руд", "шахт", "рудник", "карьер"])
-    {
-        Icon::IronMine
-    } else if has(&["gold", "золот"]) {
-        Icon::GoldMine
-    } else if has(&["copper", "медн", "медь"]) {
-        Icon::CopperMine
-    } else if has(&["chem", "хим"]) {
-        if has(&[
-            "ammonia",
-            "methanol",
-            "аммиак",
-            "метанол",
-            "азот",
-            "nitrogen",
-        ]) {
-            Icon::ChemN
-        } else {
-            Icon::ChemPet
-        }
-    } else if has(&["solar", "солнеч", "сэс"]) {
-        Icon::Solar
-    } else if has(&["wind", "ветр", "вэс"]) {
-        Icon::Wind
-    } else if has(&["cement", "цемент"]) {
-        Icon::Plant
-    } else if has(&["steel", "стал", "металлург"]) {
-        if has(&["electric", "eaf", "электро"]) {
-            Icon::SteelEaf
-        } else {
-            Icon::SteelBf
-        }
-    } else if has(&["terminal", "lng", "storage", "терминал", "спг", "хранилищ"])
-    {
-        Icon::Tank
-    } else if has(&["refiner", "нпз", "нефтеперер"]) {
-        Icon::Refinery
-    } else if has(&["oil", "нефт"]) {
-        Icon::OilField
-    } else if has(&["gas", "газ"]) {
-        Icon::GasField
-    } else if has(&["nuclear", "аэс", "атом"]) {
-        Icon::Nuclear
-    } else if has(&["hydro", "гэс"]) {
-        Icon::Hydro
-    } else if has(&["coal", "уголь", "угол"]) {
-        Icon::Coal
-    } else if has(&["thermal", "тэс"]) {
-        Icon::Thermal
-    } else {
-        Icon::Dot
-    }
-}
-
-/// Рисует круглый значок слоя: цветной круг с белой окантовкой и белый рисунок.
-pub fn paint_icon(painter: &egui::Painter, center: Pos2, radius: f32, icon: Icon, fill: Color32) {
-    painter.circle(center, radius, fill, Stroke::new(1.0, Color32::WHITE));
-    let mut mesh = egui::Mesh::default();
-    add_glyph(&mut mesh, center, radius, icon);
-    if !mesh.is_empty() {
-        painter.add(Shape::mesh(mesh));
-    }
-}
-
-const DISK_SEGMENTS: usize = 10;
-
-fn unit_circle() -> &'static [(f32, f32); DISK_SEGMENTS] {
-    static TABLE: std::sync::OnceLock<[(f32, f32); DISK_SEGMENTS]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut t = [(0.0, 0.0); DISK_SEGMENTS];
-        for (i, v) in t.iter_mut().enumerate() {
-            let a = std::f32::consts::TAU * i as f32 / DISK_SEGMENTS as f32;
-            *v = (a.cos(), a.sin());
-        }
-        t
-    })
-}
-
-/// Добавляет в сетку закрашенный круг (веер треугольников).
-fn add_disk(mesh: &mut egui::Mesh, c: Pos2, r: f32, color: Color32) {
-    let base = mesh.vertices.len() as u32;
-    mesh.colored_vertex(c, color);
-    for &(cx, cy) in unit_circle() {
-        mesh.colored_vertex(Pos2::new(c.x + cx * r, c.y + cy * r), color);
-    }
-    let n = DISK_SEGMENTS as u32;
-    for i in 0..n {
-        mesh.add_triangle(base, base + 1 + i, base + 1 + (i + 1) % n);
-    }
-}
-
-/// Добавляет в сетку кольцо между радиусами `r_in` и `r_out`.
-fn add_ring(mesh: &mut egui::Mesh, c: Pos2, r_in: f32, r_out: f32, color: Color32) {
-    let base = mesh.vertices.len() as u32;
-    for &(cx, cy) in unit_circle() {
-        mesh.colored_vertex(Pos2::new(c.x + cx * r_in, c.y + cy * r_in), color);
-        mesh.colored_vertex(Pos2::new(c.x + cx * r_out, c.y + cy * r_out), color);
-    }
-    let n = DISK_SEGMENTS as u32;
-    for i in 0..n {
-        let (a, b) = (base + 2 * i, base + 2 * ((i + 1) % n));
-        mesh.add_triangle(a, a + 1, b);
-        mesh.add_triangle(a + 1, b + 1, b);
-    }
-}
-
 /// Оставляет по одной точке на клетку `cell` пикселей: на мелком масштабе тысячи точек
 /// сливаются в пятно, и рисовать каждую незачем. Точки в конце списка (обычные, не бледные)
 /// имеют приоритет. Точки за пределами `area` остаются как есть.
@@ -1107,6 +1023,8 @@ pub struct Layer {
     pub icon: Icon,
     /// Раздел панели слоёв (сохраняется в настройках)
     pub category: Category,
+    /// Раздел выбран вручную: по содержимому слоя его больше не подбираем
+    pub category_manual: bool,
     /// Данные, вшитые в программу (тогда файл не читается)
     builtin: Option<&'static [u8]>,
     /// Значок и раздел по содержимому уже подбирались
@@ -1116,14 +1034,15 @@ pub struct Layer {
 
 impl Layer {
     pub fn new(path: PathBuf, visible: bool, color: usize) -> Self {
-        let icon = guess_icon(&path);
-        let category = categories::guess(&path);
+        // Значок и раздел подбираются по содержимому, когда слой загрузится (название
+        // файла не учитывается); до этого и для слоёв без признаков — точка и «Прочее»
         Self {
             path,
             visible,
             color,
-            icon,
-            category,
+            icon: Icon::Dot,
+            category: Category::Other,
+            category_manual: false,
             builtin: None,
             hinted: false,
             state: State::Idle,
@@ -1138,6 +1057,7 @@ impl Layer {
             color: 0,
             icon: Icon::Dot,
             category: Category::Other,
+            category_manual: true,
             builtin: Some(bytes),
             hinted: true,
             state: State::Idle,
@@ -1150,9 +1070,13 @@ impl Layer {
         self.name().to_lowercase().contains("admin_0")
     }
 
-    /// Есть ли в слое точки (значок нужен только им).
-    pub fn has_dots(&self) -> bool {
-        self.data().is_some_and(|d| !d.dots.is_empty())
+    /// Рисовать ли в панели значок слоя вместо цветного квадрата: у слоёв из точек — да,
+    /// у линейных (трубопроводы, железные дороги) остаётся квадрат цвета.
+    pub fn shows_badge(&self) -> bool {
+        match self.data() {
+            Some(d) => !d.dots.is_empty(),
+            None => self.icon != Icon::Dot, // ещё не загружен: судим по запомненному значку
+        }
     }
 
     /// Цвет слоя на карте и в панели.
@@ -1198,8 +1122,9 @@ impl Layer {
         }
     }
 
-    /// Вызывать каждый кадр.
-    pub fn poll(&mut self) {
+    /// Вызывать каждый кадр. Возвращает true, если у слоя сменились значок или раздел
+    /// (тогда нужно сохранить настройки).
+    pub fn poll(&mut self) -> bool {
         if let State::Loading(rx) = &self.state {
             match rx.try_recv() {
                 Ok(Ok(data)) => self.state = State::Ready(data),
@@ -1210,28 +1135,34 @@ impl Layer {
                 }
             }
         }
-        self.apply_hint();
+        self.apply_hint()
     }
 
-    /// Когда данные загрузились, подбирает значок и раздел по содержимому. Выбор пользователя
-    /// не трогается: меняются только значения «по имени файла» и «не задано» (точка, «Прочее»).
-    fn apply_hint(&mut self) {
+    /// Когда данные загрузились, подбирает значок и раздел по содержимому. Раздел, выбранный
+    /// вручную, не трогается; значок всегда по содержимому.
+    fn apply_hint(&mut self) -> bool {
         if self.hinted {
-            return;
+            return false;
         }
         let Some(hint) = self.data().map(|d| d.hint) else {
-            return;
+            return false;
         };
         self.hinted = true;
         let Some((icon, category)) = hint else {
-            return;
+            return false;
         };
-        if self.icon == guess_icon(&self.path) || self.icon == Icon::Dot {
-            self.icon = icon;
-        }
-        if self.category == categories::guess(&self.path) || self.category == Category::Other {
+        let before = (self.icon, self.category);
+        self.icon = icon;
+        if !self.category_manual {
             self.category = category;
         }
+        before != (self.icon, self.category)
+    }
+
+    /// Раздел, выбранный пользователем.
+    pub fn set_category(&mut self, category: Category) {
+        self.category = category;
+        self.category_manual = true;
     }
 
     pub fn is_loading(&self) -> bool {
@@ -1280,15 +1211,182 @@ pub struct LayerPlugin<'a> {
     pub filter: &'a Filter,
     /// Значок точек слоя
     pub icon: Icon,
+    /// Рисовать линии пунктиром (транспортные слои: железные дороги и т. п.)
+    pub dashed: bool,
 }
 
 /// Ключи в памяти egui: время подготовки слоёв за кадр (накапливается / последнее значение).
 pub const MS_ACC_ID: &str = "layers_ms_acc";
 pub const MS_SHOWN_ID: &str = "layers_ms_shown";
+/// То же для разбивки по частям: [мс на линии, мс на точки, точек линий, точек на карте].
+pub const PARTS_ACC_ID: &str = "layers_parts_acc";
+pub const PARTS_SHOWN_ID: &str = "layers_parts_shown";
 
 /// Если точек на экране больше, рисуются простые кружки (значки были бы слишком тяжёлыми).
 const ICON_LIMIT: usize = 1500;
 const ICON_RADIUS: f32 = 10.0;
+/// Радиус простой точки (когда значки не рисуются).
+const DOT_RADIUS: f32 = 4.0;
+/// Размер клетки спрайта в логических пикселях: радиус, белое кольцо вокруг и запас.
+const ICON_CELL: f32 = 24.0;
+const DOT_CELL: f32 = 12.0;
+const ATLAS_COLS: usize = 8;
+
+/// Готовые картинки значков и точек. Каждый значок один раз рисуется в текстуру
+/// (с учётом плотности пикселей экрана), а на карте выводится двумя прямоугольниками:
+/// круг цвета слоя и белые кольцо с рисунком. Это в десятки раз легче, чем собирать
+/// значок из сотен треугольников для каждой точки в каждом кадре.
+#[derive(Clone)]
+struct Sprites {
+    ppp: f32,
+    icon_tex: egui::TextureHandle,
+    icon_n: usize,
+    dot_tex: egui::TextureHandle,
+    dot_n: usize,
+    /// Профиль сглаживания поперёк линии: строка 0 для линий толщиной `LINE_THICK`, строка 1
+    /// для `LINE_THIN`
+    line_tex: egui::TextureHandle,
+    /// Пунктирные профили для толстых и тонких линий (повторяются вдоль линии)
+    dash_thick_tex: egui::TextureHandle,
+    dash_thin_tex: egui::TextureHandle,
+    /// Половина полной ширины ленты (с краем сглаживания) для толстых и тонких линий
+    half_thick: f32,
+    half_thin: f32,
+}
+
+/// Толщина обычных линий и бледных (и границ стран) в логических пикселях.
+const LINE_THICK: f32 = 2.0;
+const LINE_THIN: f32 = 1.5;
+const LINE_TEXELS: usize = 64;
+/// Пунктир: штрих и период в логических пикселях.
+const DASH_ON: f32 = 8.0;
+const DASH_PERIOD: f32 = 12.0;
+
+/// Сетка, в которую `strokes::strip` складывает ленты линий.
+struct MeshSink<'a> {
+    mesh: &'a mut egui::Mesh,
+    color: Color32,
+    /// Строка текстуры-профиля сплошной линии (0.25 — толстая, 0.75 — тонкая)
+    row: f32,
+    /// Период пунктира в пикселях; 0 — линия сплошная
+    period: f32,
+}
+
+impl strokes::Sink for MeshSink<'_> {
+    fn vertex(&mut self, x: f32, y: f32, across: f32, along: f32) -> u32 {
+        let v = if self.period > 0.0 {
+            along / self.period
+        } else {
+            self.row
+        };
+        self.mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(x, y),
+            uv: Pos2::new(across, v),
+            color: self.color,
+        });
+        (self.mesh.vertices.len() - 1) as u32
+    }
+
+    fn triangle(&mut self, a: u32, b: u32, c: u32) {
+        self.mesh.indices.extend_from_slice(&[a, b, c]);
+    }
+}
+
+fn upload(
+    ctx: &egui::Context,
+    name: &str,
+    cell: f32,
+    n: usize,
+    cells: &[Vec<Prim>],
+) -> egui::TextureHandle {
+    let (w, h, rgba) = raster::build_atlas(cell, n, ATLAS_COLS, cells);
+    let image = egui::ColorImage::from_rgba_premultiplied([w, h], &rgba);
+    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+}
+
+/// Спрайты для текущего масштаба экрана (создаются при первом обращении и при смене масштаба).
+fn sprites(ctx: &egui::Context) -> Sprites {
+    let id = egui::Id::new("layer_sprites");
+    let ppp = ctx.pixels_per_point();
+    if let Some(s) = ctx.data(|d| d.get_temp::<Sprites>(id)) {
+        if (s.ppp - ppp).abs() < 0.01 {
+            return s;
+        }
+    }
+    // Клетка 0 — круг, остальные — белое кольцо с рисунком значка (по номеру значка)
+    let icon_n = raster::cell_pixels(ICON_CELL, ppp);
+    let mut icon_cells = vec![vec![Prim::Disk(ICON_RADIUS)]];
+    for icon in crate::icons::ALL {
+        icon_cells.push(vec![
+            Prim::Ring(ICON_RADIUS, ICON_RADIUS + 1.0),
+            Prim::Tris(icon.tris(), ICON_RADIUS * 0.66),
+        ]);
+    }
+    let dot_n = raster::cell_pixels(DOT_CELL, ppp);
+    let dot_cells = vec![
+        vec![Prim::Disk(DOT_RADIUS)],
+        vec![Prim::Ring(DOT_RADIUS, DOT_RADIUS + 1.0)],
+    ];
+    // Сглаживание края линии — один физический пиксель, как у egui
+    let feather = 1.0 / ppp;
+    let mut ramp = Vec::with_capacity(LINE_TEXELS * 2 * 4);
+    for width in [LINE_THICK, LINE_THIN] {
+        for a in raster::line_ramp(width, feather, LINE_TEXELS) {
+            ramp.extend_from_slice(&[a, a, a, a]);
+        }
+    }
+    let ramp_image = egui::ColorImage::from_rgba_premultiplied([LINE_TEXELS, 2], &ramp);
+    // Пунктир: четыре строки на физический пиксель вдоль периода, текстура повторяется
+    let dash_rows = ((DASH_PERIOD * ppp * 4.0).round() as usize).max(8);
+    let repeat = egui::TextureOptions {
+        wrap_mode: egui::TextureWrapMode::Repeat,
+        ..egui::TextureOptions::LINEAR
+    };
+    let dash_tex = |name: &str, width: f32| {
+        let alpha = raster::dash_ramp(width, feather, LINE_TEXELS, DASH_ON, DASH_PERIOD, dash_rows);
+        let mut px = Vec::with_capacity(alpha.len() * 4);
+        for a in alpha {
+            px.extend_from_slice(&[a, a, a, a]);
+        }
+        let image = egui::ColorImage::from_rgba_premultiplied([LINE_TEXELS, dash_rows], &px);
+        ctx.load_texture(name, image, repeat)
+    };
+    let s = Sprites {
+        ppp,
+        line_tex: ctx.load_texture("layer_lines", ramp_image, egui::TextureOptions::LINEAR),
+        dash_thick_tex: dash_tex("layer_dash_thick", LINE_THICK),
+        dash_thin_tex: dash_tex("layer_dash_thin", LINE_THIN),
+        half_thick: raster::line_half(LINE_THICK, feather),
+        half_thin: raster::line_half(LINE_THIN, feather),
+        icon_tex: upload(ctx, "layer_icons", ICON_CELL, icon_n, &icon_cells),
+        icon_n,
+        dot_tex: upload(ctx, "layer_dots", DOT_CELL, dot_n, &dot_cells),
+        dot_n,
+    };
+    ctx.data_mut(|d| d.insert_temp(id, s.clone()));
+    s
+}
+
+/// Значок слоя в панели: круг цвета слоя с белым кольцом и рисунком. `size` — сторона
+/// клетки значка в логических пикселях (у самого значка вокруг есть небольшой запас).
+pub fn paint_badge(ui: &egui::Ui, center: Pos2, size: f32, icon: Icon, fill: Color32) {
+    let sprites = sprites(ui.ctx());
+    let total = 1 + crate::icons::ALL.len();
+    let uv = |k: usize| {
+        let u = raster::cell_uv(k, sprites.icon_n, ATLAS_COLS, total);
+        egui::Rect::from_min_max(Pos2::new(u[0], u[1]), Pos2::new(u[2], u[3]))
+    };
+    let ppp = sprites.ppp;
+    let center = Pos2::new(
+        (center.x * ppp).round() / ppp,
+        (center.y * ppp).round() / ppp,
+    );
+    let rect = egui::Rect::from_center_size(center, egui::Vec2::splat(size));
+    let mut mesh = egui::Mesh::with_texture(sprites.icon_tex.id());
+    mesh.add_rect_with_uv(rect, uv(0), fill);
+    mesh.add_rect_with_uv(rect, uv(icon as usize + 1), Color32::WHITE);
+    ui.painter().add(Shape::mesh(mesh));
+}
 
 impl Plugin for LayerPlugin<'_> {
     fn run(
@@ -1317,6 +1415,7 @@ impl Plugin for LayerPlugin<'_> {
         ];
         let max_tol = 0.7 / t.sx; // 0.7 пикселя в единицах Mercator
         let painter = ui.painter_at(rect);
+        let sprites = sprites(ui.ctx());
 
         // Курсор над картой (но не во время перетаскивания и не над кнопками)
         // Касание или клик (его положение кладёт в память main.rs) ловится с запасом побольше,
@@ -1332,6 +1431,7 @@ impl Plugin for LayerPlugin<'_> {
             (None, LINE_HIT_PX)
         };
         let mut best: Option<(f32, u32)> = None; // (расстояние в пикселях, номер подписи)
+        let mut line_pts = 0usize; // сколько точек линий отдано на рисование (для подсказки)
 
         let solid = self.color;
         let pale = Color32::from_rgba_unmultiplied(solid.r(), solid.g(), solid.b(), 110);
@@ -1349,6 +1449,30 @@ impl Plugin for LayerPlugin<'_> {
         };
         let shown = |label: u32| !filtering || pass.get(label as usize).copied().unwrap_or(false);
 
+        // Линии рисуются двумя сетками: тонкие (бледные, границы стран) и обычные. Бледные идут
+        // первыми, чтобы обычные оказались сверху. Подробнее — в модуле strokes.
+        let caps_id = egui::Id::new(("line_caps", self.layer_id));
+        let caps = ui
+            .ctx()
+            .data(|d| d.get_temp::<[usize; 2]>(caps_id))
+            .unwrap_or([0, 0]);
+        let (thin_tex, thick_tex, period) = if self.dashed {
+            (
+                sprites.dash_thin_tex.id(),
+                sprites.dash_thick_tex.id(),
+                DASH_PERIOD,
+            )
+        } else {
+            (sprites.line_tex.id(), sprites.line_tex.id(), 0.0)
+        };
+        let mut pale_mesh = egui::Mesh::with_texture(thin_tex);
+        let mut solid_mesh = egui::Mesh::with_texture(thick_tex);
+        for (mesh, cap) in [(&mut pale_mesh, caps[0]), (&mut solid_mesh, caps[1])] {
+            mesh.vertices.reserve(cap + cap / 8);
+            mesh.indices.reserve(3 * (cap + cap / 8));
+        }
+        let thin_color = if self.borders { solid } else { pale };
+
         for line in &self.data.lines {
             if !line.overlaps(view) || !shown(line.label) {
                 continue;
@@ -1358,14 +1482,9 @@ impl Plugin for LayerPlugin<'_> {
             {
                 continue;
             }
-            let stroke = if self.borders {
-                Stroke::new(1.5, solid)
-            } else if line.faded {
-                Stroke::new(1.5, pale)
-            } else {
-                Stroke::new(2.0, solid)
-            };
+            let is_thin = self.borders || line.faded;
             visible_runs(line.lod(max_tol), &t, clip, Pos2::new, |run| {
+                line_pts += run.len();
                 if let Some(p) = pointer {
                     for w in run.windows(2) {
                         let d = seg_distance((p.x, p.y), (w[0].x, w[0].y), (w[1].x, w[1].y));
@@ -1374,10 +1493,39 @@ impl Plugin for LayerPlugin<'_> {
                         }
                     }
                 }
-                painter.add(Shape::line(run, stroke));
+                if is_thin {
+                    let mut sink = MeshSink {
+                        mesh: &mut pale_mesh,
+                        color: thin_color,
+                        row: 0.75,
+                        period,
+                    };
+                    strokes::strip(run, |p| (p.x, p.y), sprites.half_thin, &mut sink);
+                } else {
+                    let mut sink = MeshSink {
+                        mesh: &mut solid_mesh,
+                        color: solid,
+                        row: 0.25,
+                        period,
+                    };
+                    strokes::strip(run, |p| (p.x, p.y), sprites.half_thick, &mut sink);
+                }
             });
         }
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(
+                caps_id,
+                [pale_mesh.vertices.len(), solid_mesh.vertices.len()],
+            );
+        });
+        if !pale_mesh.is_empty() {
+            painter.add(Shape::mesh(pale_mesh));
+        }
+        if !solid_mesh.is_empty() {
+            painter.add(Shape::mesh(solid_mesh));
+        }
 
+        let lines_ms = started.elapsed().as_secs_f32() * 1000.0;
         let mut visible: Vec<(f32, f32, bool, u32)> = Vec::new();
         for dot in &self.data.dots {
             let [x, y] = dot.pos;
@@ -1397,16 +1545,35 @@ impl Plugin for LayerPlugin<'_> {
         } else if visible.len() > 600 {
             visible = thin(visible, 7.0, clip);
         }
-        let radius = if glyphs { ICON_RADIUS } else { 4.0 };
-        let mut mesh = egui::Mesh::default();
+        let radius = if glyphs { ICON_RADIUS } else { DOT_RADIUS };
+        let ppp = sprites.ppp;
+        let (tex, n, cell, total, top) = if glyphs {
+            (
+                sprites.icon_tex.id(),
+                sprites.icon_n,
+                ICON_CELL,
+                1 + crate::icons::ALL.len(),
+                self.icon as usize + 1,
+            )
+        } else {
+            (sprites.dot_tex.id(), sprites.dot_n, DOT_CELL, 2, 1)
+        };
+        let uv = |k: usize| {
+            let u = raster::cell_uv(k, n, ATLAS_COLS, total);
+            egui::Rect::from_min_max(Pos2::new(u[0], u[1]), Pos2::new(u[2], u[3]))
+        };
+        let (uv_disk, uv_top) = (uv(0), uv(top));
+        let size = egui::Vec2::splat(cell);
+        let mut mesh = egui::Mesh::with_texture(tex);
+        mesh.reserve_vertices(visible.len() * 8);
+        mesh.reserve_triangles(visible.len() * 4);
         for &(sx, sy, faded, label) in &visible {
             let fill = if faded { pale } else { solid };
-            let center = Pos2::new(sx, sy);
-            add_ring(&mut mesh, center, radius, radius + 1.0, Color32::WHITE);
-            add_disk(&mut mesh, center, radius, fill);
-            if glyphs {
-                add_glyph(&mut mesh, center, radius, self.icon);
-            }
+            // Центр совмещаем с пикселями экрана: картинка получается чёткой
+            let center = Pos2::new((sx * ppp).round() / ppp, (sy * ppp).round() / ppp);
+            let rect = egui::Rect::from_center_size(center, size);
+            mesh.add_rect_with_uv(rect, uv_disk, fill);
+            mesh.add_rect_with_uv(rect, uv_top, Color32::WHITE);
             if let Some(p) = pointer {
                 // Точки легче поймать, чем линии: вычитаем небольшой бонус
                 let d = ((p.x - sx).powi(2) + (p.y - sy).powi(2)).sqrt()
@@ -1417,9 +1584,11 @@ impl Plugin for LayerPlugin<'_> {
                 }
             }
         }
+        let drawn_dots = visible.len();
         if !mesh.is_empty() {
             painter.add(Shape::mesh(mesh));
         }
+        let dots_ms = started.elapsed().as_secs_f32() * 1000.0 - lines_ms;
 
         // Выбранный нажатием объект: белый ореол и более толстая линия поверх остальных
         if let Some(sel) = self.selected {
@@ -1430,8 +1599,8 @@ impl Plugin for LayerPlugin<'_> {
                     continue;
                 }
                 visible_runs(line.lod(max_tol), &t, clip, Pos2::new, |run| {
-                    painter.add(Shape::line(run.clone(), halo));
-                    painter.add(Shape::line(run, main));
+                    painter.add(Shape::line(run.to_vec(), halo));
+                    painter.add(Shape::line(run.to_vec(), main));
                 });
             }
             for dot in self.data.dots.iter().filter(|d| d.label == sel) {
@@ -1482,6 +1651,13 @@ impl Plugin for LayerPlugin<'_> {
             let id = egui::Id::new(MS_ACC_ID);
             let total = d.get_temp::<f32>(id).unwrap_or(0.0) + ms;
             d.insert_temp(id, total);
+            let id = egui::Id::new(PARTS_ACC_ID);
+            let mut parts = d.get_temp::<[f32; 4]>(id).unwrap_or([0.0; 4]);
+            parts[0] += lines_ms;
+            parts[1] += dots_ms;
+            parts[2] += line_pts as f32;
+            parts[3] += drawn_dots as f32;
+            d.insert_temp(id, parts);
         });
     }
 }
@@ -1516,51 +1692,6 @@ impl Plugin for FitProbe {
 mod icon_tests {
     use super::*;
 
-    #[test]
-    fn guess() {
-        let g = |n: &str| guess_icon(Path::new(n));
-        assert_eq!(g("oil_fields.geojson"), Icon::OilField);
-        assert_eq!(g("gas_fields.geojson"), Icon::GasField);
-        assert_eq!(g("refineries_final.geojson"), Icon::Refinery);
-        assert_eq!(g("nuclear_plants.geojson"), Icon::Nuclear);
-        assert_eq!(g("hydro_plants.geojson"), Icon::Hydro);
-        assert_eq!(g("coal_plants.geojson"), Icon::Coal);
-        assert_eq!(g("thermal_plants.geojson"), Icon::Thermal);
-        assert_eq!(g("coal_mines.geojson"), Icon::CoalMine);
-        assert_eq!(g("coal_terminals.geojson"), Icon::CoalTerminal);
-        assert_eq!(g("solar_plants.geojson"), Icon::Solar);
-        assert_eq!(g("wind_plants.geojson"), Icon::Wind);
-        assert_eq!(g("Солнечные электростанции.geojson"), Icon::Solar);
-        assert_eq!(g("Ветровые электростанции.geojson"), Icon::Wind);
-        assert_eq!(g("cement_plants.geojson"), Icon::Plant);
-        assert_eq!(g("Цементные заводы.geojson"), Icon::Plant);
-        assert_eq!(g("Золото.geojson"), Icon::GoldMine);
-        assert_eq!(g("Медь.geojson"), Icon::CopperMine);
-        assert_eq!(g("gold_mines.geojson"), Icon::GoldMine);
-        assert_eq!(g("Золотые рудники.geojson"), Icon::GoldMine);
-        assert_eq!(g("copper_mines.geojson"), Icon::CopperMine);
-        assert_eq!(g("Медные рудники.geojson"), Icon::CopperMine);
-        assert_eq!(g("iron_ore_mines.geojson"), Icon::IronMine);
-        assert_eq!(g("Железорудные шахты.geojson"), Icon::IronMine);
-        assert_eq!(g("chemicals_ammonia.geojson"), Icon::ChemN);
-        assert_eq!(g("Химия - аммиак и метанол.geojson"), Icon::ChemN);
-        assert_eq!(g("Нефтехимия.geojson"), Icon::ChemPet);
-        assert_eq!(g("chemicals_petro.geojson"), Icon::ChemPet);
-        assert_eq!(g("steel_integrated.geojson"), Icon::SteelBf);
-        assert_eq!(g("steel_electric.geojson"), Icon::SteelEaf);
-        assert_eq!(g("Металлургические комбинаты.geojson"), Icon::SteelBf);
-        assert_eq!(g("Сталелитейные комбинаты.geojson"), Icon::SteelBf);
-        assert_eq!(g("Электросталеплавильные заводы.geojson"), Icon::SteelEaf);
-        assert_eq!(g("gas_terminals.geojson"), Icon::Tank);
-        assert_eq!(g("lng_terminals.geojson"), Icon::Tank);
-        assert_eq!(g("oil_storage.geojson"), Icon::Tank);
-        assert_eq!(g("airports.geojson"), Icon::Airport);
-        assert_eq!(g("seaports.geojson"), Icon::Port);
-        assert_eq!(g("ports.geojson"), Icon::Port);
-        assert_eq!(g("transport.geojson"), Icon::Dot);
-        assert_eq!(g("pipelines.geojson"), Icon::Dot);
-    }
-
     fn hint(json: &str) -> Option<(Icon, Category)> {
         parse(json.as_bytes()).unwrap().hint
     }
@@ -1571,6 +1702,12 @@ mod icon_tests {
         )
     }
 
+    fn line(props: &str) -> String {
+        format!(
+            r#"{{"type":"Feature","properties":{props},"geometry":{{"type":"LineString","coordinates":[[10.0,50.0],[11.0,51.0]]}}}}"#
+        )
+    }
+
     fn collection(features: &[String]) -> String {
         format!(
             r#"{{"type":"FeatureCollection","features":[{}]}}"#,
@@ -1578,35 +1715,167 @@ mod icon_tests {
         )
     }
 
+    /// Слой из одного объекта с такими свойствами: какой значок и раздел определились.
+    fn one(props: &str) -> Option<(Icon, Category)> {
+        hint(&collection(&[point(props)]))
+    }
+
     #[test]
-    fn hint_by_content() {
-        let gold = point(
-            r#"{"Name":"A","Status":"operating","industrial":"Золотой рудник","Fuel":"золото"}"#,
+    fn by_industrial() {
+        use Category::*;
+        let t = |kind: &str| {
+            one(&format!(
+                r#"{{"Name":"A","Status":"operating","industrial":"{kind}"}}"#
+            ))
+        };
+        assert_eq!(t("Золотой рудник"), Some((Icon::GoldMine, Mining)));
+        assert_eq!(t("Медный рудник"), Some((Icon::CopperMine, Mining)));
+        assert_eq!(
+            t("Железорудная шахта или карьер"),
+            Some((Icon::IronMine, Mining))
+        );
+        assert_eq!(t("Угольная шахта"), Some((Icon::CoalMine, Mining)));
+        assert_eq!(t("Угольный разрез"), Some((Icon::CoalMine, Mining)));
+        assert_eq!(
+            t("Угольный терминал (импорт)"),
+            Some((Icon::CoalTerminal, Industry))
+        );
+        assert_eq!(t("Крупный аэропорт"), Some((Icon::Airport, Transport)));
+        assert_eq!(t("Космодром"), Some((Icon::Airport, Transport)));
+        assert_eq!(t("Морской или речной порт"), Some((Icon::Port, Transport)));
+        assert_eq!(
+            t("Цементный завод полного цикла (обжиг клинкера и помол)"),
+            Some((Icon::Cement, Industry))
         );
         assert_eq!(
-            hint(&collection(&[gold.clone(), gold])),
-            Some((Icon::GoldMine, Category::Mining))
-        );
-        let cu = point(
-            r#"{"Name":"A","Status":"operating","industrial":"Медный рудник","Fuel":"медь"}"#,
+            t("Помольный завод (цемент из привозного клинкера)"),
+            Some((Icon::Cement, Industry))
         );
         assert_eq!(
-            hint(&collection(&[cu])),
-            Some((Icon::CopperMine, Category::Mining))
-        );
-        let wind = point(
-            r#"{"Name":"A","Status":"operating","industrial":"Ветровая электростанция (береговая)"}"#,
+            t("Производство аммиака и метанола"),
+            Some((Icon::ChemN, Industry))
         );
         assert_eq!(
-            hint(&collection(&[wind])),
-            Some((Icon::Wind, Category::Power))
+            t("Нефтехимия: олефины и ароматика"),
+            Some((Icon::ChemPet, Industry))
         );
+        assert_eq!(
+            t("Электрометаллургический завод"),
+            Some((Icon::SteelEaf, Industry))
+        );
+        assert_eq!(
+            t("Завод прямого восстановления железа"),
+            Some((Icon::SteelEaf, Industry))
+        );
+        assert_eq!(
+            t("Интегрированный комбинат (доменные печи)"),
+            Some((Icon::SteelBf, Industry))
+        );
+        assert_eq!(
+            t("Металлургический завод (тип не уточнён)"),
+            Some((Icon::SteelBf, Industry))
+        );
+        assert_eq!(t("Солнечная электростанция"), Some((Icon::Solar, Power)));
+        assert_eq!(
+            t("Ветровая электростанция (морская)"),
+            Some((Icon::Wind, Power))
+        );
+        assert_eq!(
+            t("плотинная (с водохранилищем)"),
+            Some((Icon::Hydro, Power))
+        );
+        assert_eq!(t("гидроаккумулирующая (ГАЭС)"), Some((Icon::Hydro, Power)));
+        assert_eq!(t("Угольная ТЭС"), Some((Icon::Coal, Power)));
+        assert_eq!(
+            t("Угольная ТЭЦ (с выработкой тепла)"),
+            Some((Icon::Coal, Power))
+        );
+        assert_eq!(t("ТЭС"), Some((Icon::Thermal, Power)));
+        assert_eq!(t("ТЭЦ (с выработкой тепла)"), Some((Icon::Thermal, Power)));
+        assert_eq!(t("refinery"), Some((Icon::Refinery, Industry)));
+        assert_eq!(t("oil_storage"), Some((Icon::Tank, Industry)));
+        assert_eq!(t("gas_storage"), Some((Icon::Tank, Industry)));
+        // Неизвестный тип: подсказки нет
+        assert_eq!(t("что-то своё"), None);
+    }
+
+    #[test]
+    fn by_other_fields() {
+        use Category::*;
+        assert_eq!(
+            one(r#"{"Name":"A","TerminalName":"Abadi LNG Terminal","Fuel":"LNG"}"#),
+            Some((Icon::Tank, Industry))
+        );
+        assert_eq!(
+            one(r#"{"Name":"A","Reactor":"PWR","Units":"2"}"#),
+            Some((Icon::Nuclear, Power))
+        );
+        // Месторождения: поле «Ресурс» и прежнее «Fuel»
+        let f = |v: &str| one(&format!(r#"{{"Name":"A","Ресурс":"{v}"}}"#));
+        assert_eq!(f("Нефть"), Some((Icon::OilField, Mining)));
+        assert_eq!(f("Нефть и газ"), Some((Icon::OilField, Mining)));
+        assert_eq!(
+            f("Нефть и газ (преимущественно нефть)"),
+            Some((Icon::OilField, Mining))
+        );
+        assert_eq!(f("Газ"), Some((Icon::GasField, Mining)));
+        assert_eq!(f("Газ и конденсат"), Some((Icon::GasField, Mining)));
+        assert_eq!(
+            f("Нефть и газ (преимущественно газ)"),
+            Some((Icon::GasField, Mining))
+        );
+        assert_eq!(
+            one(r#"{"Name":"A","Fuel":"Газ"}"#),
+            Some((Icon::GasField, Mining))
+        );
+    }
+
+    #[test]
+    fn lines() {
+        use Category::*;
+        let pipe =
+            line(r#"{"PipelineName":"Double E Pipeline","Fuel":"Gas","Status":"operating"}"#);
+        assert_eq!(hint(&collection(&[pipe])), Some((Icon::Dot, Pipelines)));
+        let rail = line(r#"{"featurecla":"Railroad","scalerank":10}"#);
+        assert_eq!(hint(&collection(&[rail])), Some((Icon::Dot, Transport)));
+    }
+
+    #[test]
+    fn unknown_and_mixed() {
         // Чужой файл без признаков: подсказки нет
-        let other = point(r#"{"Name":"A","Status":"operating"}"#);
-        assert_eq!(hint(&collection(&[other])), None);
+        assert_eq!(one(r#"{"Name":"A","Status":"operating"}"#), None);
         // Смесь без явного большинства: подсказки нет
         let a = point(r#"{"Name":"A","industrial":"Золотой рудник"}"#);
         let b = point(r#"{"Name":"B","industrial":"Медный рудник"}"#);
         assert_eq!(hint(&collection(&[a, b])), None);
+        // Название файла роли не играет: слой «Золото» без содержимого остаётся точкой
+        let layer = Layer::new(PathBuf::from("Золото.geojson"), true, 0);
+        assert_eq!((layer.icon, layer.category), (Icon::Dot, Category::Other));
+    }
+
+    #[test]
+    fn fuel_is_resource_for_mining() {
+        let details = |json: &str| {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            make_label(v.as_object()).details
+        };
+        let mine = details(r#"{"Name":"A","industrial":"Золотой рудник","Fuel":"золото"}"#);
+        assert!(mine.contains(&"Ресурс: золото".to_string()));
+        let field = details(r#"{"Name":"A","Fuel":"Нефть"}"#);
+        assert!(field.contains(&"Ресурс: Нефть".to_string()));
+        let plant = details(r#"{"Name":"A","industrial":"ТЭС","Fuel":"природный газ"}"#);
+        assert!(plant.contains(&"Топливо: природный газ".to_string()));
+    }
+
+    #[test]
+    fn hint_respects_manual_choice() {
+        let gold = point(r#"{"Name":"A","industrial":"Золотой рудник"}"#);
+        let data = parse(collection(&[gold]).as_bytes()).unwrap();
+        let mut layer = Layer::new(PathBuf::from("x.geojson"), true, 0);
+        layer.set_category(Category::Industry);
+        layer.state = State::Ready(data);
+        assert!(layer.apply_hint());
+        assert_eq!(layer.icon, Icon::GoldMine);
+        assert_eq!(layer.category, Category::Industry); // выбранный вручную раздел сохранён
     }
 }

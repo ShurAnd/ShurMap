@@ -5,6 +5,7 @@ mod categories;
 mod countries;
 mod icons;
 mod layers;
+mod osk;
 mod raster;
 mod settings;
 mod strokes;
@@ -606,7 +607,13 @@ fn color_picker(
 }
 
 /// Панель фильтра по странам. Возвращает true, если отметки изменились.
-fn filter_panel(ui: &mut egui::Ui, filter: &mut countries::Filter, search: &mut String) -> bool {
+fn filter_panel(
+    ui: &mut egui::Ui,
+    filter: &mut countries::Filter,
+    search: &mut String,
+    osk: &mut Osk,
+    list_height: f32,
+) -> bool {
     let list = &countries::get().list;
     let mut changed = false;
     ui.set_width(310.0);
@@ -664,17 +671,35 @@ fn filter_panel(ui: &mut egui::Ui, filter: &mut countries::Filter, search: &mut 
     }
     ui.separator();
 
-    ui.add(
-        egui::TextEdit::singleline(search)
-            .hint_text("Поиск страны…")
-            .desired_width(f32::INFINITY),
-    );
+    ui.horizontal(|ui| {
+        let button_w = 48.0;
+        let field = ui.add(
+            egui::TextEdit::singleline(search)
+                .id(search_field_id())
+                .hint_text("Поиск страны…")
+                .desired_width(ui.available_width() - button_w - ui.spacing().item_spacing.x),
+        );
+        // Нажатие на строку поиска показывает экранную клавиатуру
+        if field.clicked() || field.gained_focus() {
+            osk.open = true;
+        }
+        if ui
+            .add_sized(
+                [button_w, field.rect.height()],
+                egui::Button::new("АБВ").selected(osk.open),
+            )
+            .on_hover_text("Экранная клавиатура")
+            .clicked()
+        {
+            osk.open = !osk.open;
+        }
+    });
     let needle = countries::norm(search);
     egui::ScrollArea::vertical()
         .id_salt("filter_scroll")
         .auto_shrink([false, false])
-        .min_scrolled_height(240.0)
-        .max_height(240.0)
+        .min_scrolled_height(list_height)
+        .max_height(list_height)
         .show(ui, |ui| {
             // Общая строка «Россия»: отмечает или снимает обе части сразу
             if needle.is_empty() || "россия".contains(&needle) {
@@ -724,6 +749,91 @@ fn filter_panel(ui: &mut egui::Ui, filter: &mut countries::Filter, search: &mut 
         filter.rebuild();
     }
     changed
+}
+
+/// Состояние экранной клавиатуры.
+#[derive(Default)]
+struct Osk {
+    open: bool,
+    /// Включена английская раскладка
+    latin: bool,
+}
+
+/// Высота клавиатуры с запасом: по ней окошко фильтра укорачивает список стран.
+const OSK_HEIGHT: f32 = 300.0;
+
+fn search_field_id() -> egui::Id {
+    egui::Id::new("filter_search_field")
+}
+
+/// Экранная клавиатура внизу окна для строки поиска. Возвращает занятый ею прямоугольник
+/// и признак того, что текст изменился.
+fn keyboard(ctx: &egui::Context, osk: &mut Osk, text: &mut String) -> (egui::Rect, bool) {
+    let gap = 4.0;
+    let screen = ctx.content_rect();
+    let width = (screen.width() - 40.0).clamp(300.0, 820.0);
+    let unit = ((width - 16.0 - gap * (osk::UNITS - 1.0)) / osk::UNITS).clamp(24.0, 64.0);
+    let height = (unit * 0.9).clamp(34.0, 56.0);
+    let full = unit * osk::UNITS + gap * (osk::UNITS - 1.0);
+    let latin = osk.latin;
+    let mut edited = false;
+    let mut touched = false;
+
+    let area = egui::Area::new(egui::Id::new("on_screen_keyboard"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -10.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+                for row in osk::rows(latin) {
+                    let row_w: f32 = row
+                        .iter()
+                        .map(|c| unit * c.width + gap * (c.width - 1.0))
+                        .sum::<f32>()
+                        + gap * (row.len() as f32 - 1.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(((full - row_w) / 2.0).max(0.0));
+                        for c in row {
+                            let w = unit * c.width + gap * (c.width - 1.0);
+                            let caption = osk::label(c.key, latin);
+                            let size = if caption.chars().count() == 1 {
+                                22.0
+                            } else {
+                                15.0
+                            };
+                            let key = ui.add_sized(
+                                [w, height],
+                                egui::Button::new(egui::RichText::new(caption).size(size)),
+                            );
+                            if key.clicked() {
+                                touched = true;
+                                match osk::press(text, c.key) {
+                                    osk::Effect::Edited => edited = true,
+                                    osk::Effect::ToggleLang => osk.latin = !osk.latin,
+                                    osk::Effect::Close => osk.open = false,
+                                    osk::Effect::Nothing => {}
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        });
+
+    // Нажатая кнопка забирает фокус у строки поиска — возвращаем его и ставим курсор в конец
+    if touched && osk.open {
+        let id = search_field_id();
+        ctx.memory_mut(|m| m.request_focus(id));
+        if edited {
+            let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+            let end = egui::text::CCursor::new(text.chars().count());
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(ctx, id);
+        }
+    }
+    (area.response.rect, edited)
 }
 
 /// Что произошло в панели слоёв за кадр.
@@ -969,6 +1079,8 @@ struct ViewerApp {
     filter: countries::Filter,
     filter_open: bool,
     filter_search: String,
+    /// Экранная клавиатура для строки поиска
+    osk: Osk,
     /// Рисовать точки значками (флаг в панели слоёв)
     /// Свёрнутые разделы панели слоёв (по номеру категории)
     closed: [bool; 6],
@@ -996,6 +1108,7 @@ impl ViewerApp {
             filter: countries::Filter::default(),
             filter_open: false,
             filter_search: String::new(),
+            osk: Osk::default(),
             closed: [false; 6],
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
@@ -1454,30 +1567,57 @@ impl eframe::App for ViewerApp {
                     {
                         let button = filter_rect;
                         let mut changed = false;
+                        // Под клавиатурой список стран делаем ниже, чтобы окошко не уходило под неё
+                        // и поднимаем окошко к верхнему краю окна
+                        let screen = ui.ctx().content_rect();
+                        let top = if self.osk.open {
+                            screen.top() + 6.0
+                        } else {
+                            button.top()
+                        };
+                        let list_height = if self.osk.open {
+                            (screen.height() - top - OSK_HEIGHT - 300.0).clamp(80.0, 240.0)
+                        } else {
+                            240.0
+                        };
                         let area = egui::Area::new(egui::Id::new("filter_panel"))
                             .order(egui::Order::Foreground)
                             .pivot(egui::Align2::RIGHT_TOP)
-                            .fixed_pos(button.left_top() + egui::vec2(-8.0, 0.0))
+                            .fixed_pos(egui::pos2(button.left() - 8.0, top))
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    changed =
-                                        filter_panel(ui, &mut self.filter, &mut self.filter_search);
+                                    changed = filter_panel(
+                                        ui,
+                                        &mut self.filter,
+                                        &mut self.filter_search,
+                                        &mut self.osk,
+                                        list_height,
+                                    );
                                 });
                             });
+                        let keyboard_rect = if self.osk.open {
+                            Some(keyboard(ui.ctx(), &mut self.osk, &mut self.filter_search).0)
+                        } else {
+                            None
+                        };
                         if changed {
                             self.pinned = None;
                             self.save_settings();
                         }
-                        // Нажатие вне окошка и вне кнопки закрывает его
+                        // Нажатие вне окошка, вне кнопки и вне клавиатуры закрывает окошко
                         if ui.ctx().input(|s| s.pointer.primary_pressed()) {
                             let pos = ui.ctx().input(|s| s.pointer.interact_pos());
                             if pos.is_some_and(|p| {
-                                !area.response.rect.contains(p) && !button.contains(p)
+                                !area.response.rect.contains(p)
+                                    && !button.contains(p)
+                                    && !keyboard_rect.is_some_and(|k| k.contains(p))
                             }) {
                                 self.filter_open = false;
                             }
                         }
                     }
+                } else {
+                    self.osk.open = false;
                 }
             }
             None => {

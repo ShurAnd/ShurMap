@@ -24,6 +24,10 @@ const APP_NAME: &str = "ShurMap";
 /// Нейтральный светло-серый фон вокруг карты (виден, когда карта отдалена до размера меньше окна)
 const MAP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(222, 225, 230);
 /// Версия берётся из Cargo.toml (поле version), чтобы её не нужно было менять в двух местах
+/// Отступ боковых панелей и кнопок от левого и правого краёв окна: на сенсорном экране
+/// у самого края могут быть системные жесты и кнопки.
+const EDGE_MARGIN: f32 = 40.0;
+
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
@@ -299,7 +303,7 @@ fn fullscreen_corner_buttons(ctx: &egui::Context, rect: egui::Rect) {
         .order(egui::Order::Foreground)
         .pivot(egui::Align2::RIGHT_TOP)
         .fixed_pos(egui::pos2(
-            rect.right() - 16.0 - 48.0 - 12.0,
+            rect.right() - EDGE_MARGIN - 48.0 - 12.0,
             rect.top() + 16.0,
         ))
         .show(ctx, |ui| {
@@ -312,7 +316,7 @@ fn fullscreen_corner_buttons(ctx: &egui::Context, rect: egui::Rect) {
     egui::Area::new(egui::Id::new("close_button"))
         .order(egui::Order::Foreground)
         .pivot(egui::Align2::RIGHT_TOP)
-        .fixed_pos(egui::pos2(rect.right() - 16.0, rect.top() + 16.0))
+        .fixed_pos(egui::pos2(rect.right() - EDGE_MARGIN, rect.top() + 16.0))
         .show(ctx, |ui| {
             close = close_button(ui);
         });
@@ -1116,7 +1120,7 @@ fn layers_panel(
                         }
                     }
 
-                    // Кнопка слоя: нажата = слой включён
+                    // Строка слоя: нажата = слой включён. Кликабельна вся ширина до корзины.
                     let hover = format!(
                         "{}\n{}",
                         layer.path.display(),
@@ -1125,19 +1129,40 @@ fn layers_panel(
                             .map(|d| format!("Объектов на карте: {}", d.objects))
                             .unwrap_or_default()
                     );
-                    let mut visible = layer.visible;
-                    ui.toggle_value(&mut visible, layers::short_name(&layer.name(), 28))
-                        .on_hover_text(hover);
-                    if visible != layer.visible {
-                        layer.visible = visible;
-                        if visible {
+                    let name_w =
+                        (ui.available_width() - 22.0 - ui.spacing().item_spacing.x * 2.0).max(60.0);
+                    let (name_rect, name_resp) = ui.allocate_exact_size(
+                        egui::vec2(name_w, ui.spacing().interact_size.y),
+                        egui::Sense::click(),
+                    );
+                    let name_resp = name_resp.on_hover_text(hover);
+                    if ui.is_rect_visible(name_rect) {
+                        let v = ui.style().interact_selectable(&name_resp, layer.visible);
+                        ui.painter()
+                            .rect_filled(name_rect, v.corner_radius, v.weak_bg_fill);
+                        ui.painter().text(
+                            egui::pos2(name_rect.left() + 6.0, name_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            layers::short_name(&layer.name(), 40),
+                            egui::TextStyle::Button.resolve(ui.style()),
+                            v.text_color(),
+                        );
+                        if layer.is_loading() {
+                            // Индикатор загрузки внутри строки, у правого края
+                            let spot = egui::Rect::from_center_size(
+                                egui::pos2(name_rect.right() - 14.0, name_rect.center().y),
+                                egui::vec2(14.0, 14.0),
+                            );
+                            egui::Spinner::new().paint_at(ui, spot);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    if name_resp.clicked() {
+                        layer.visible = !layer.visible;
+                        if layer.visible {
                             layer.retry_if_failed();
                         }
                         result.changed = true;
-                    }
-
-                    if layer.is_loading() {
-                        ui.spinner();
                     }
 
                     // Корзина у правого края строки
@@ -1264,14 +1289,12 @@ impl ViewerApp {
                 .iter()
                 .map(|l| settings::LayerEntry {
                     path: l.path.to_string_lossy().into_owned(),
-                    visible: l.visible,
                     color: l.color,
                     icon: Some(l.icon.key().to_string()),
                     category: Some(l.category.key().to_string()),
                     category_manual: l.category_manual,
                 })
                 .collect(),
-            filter: self.filter.codes(),
             closed_categories: categories::ALL
                 .iter()
                 .filter(|c| self.closed[**c as usize])
@@ -1625,7 +1648,7 @@ impl eframe::App for ViewerApp {
                     egui::Area::new(egui::Id::new("fullscreen_button"))
                         .pivot(egui::Align2::RIGHT_BOTTOM)
                         .fixed_pos(egui::pos2(
-                            map_rect.right() - 16.0,
+                            map_rect.right() - EDGE_MARGIN,
                             map_rect.center().y - 48.0 - 14.0,
                         ))
                         .show(ui.ctx(), |ui| {
@@ -1644,7 +1667,7 @@ impl eframe::App for ViewerApp {
                 egui::Area::new(egui::Id::new("filter_button"))
                     .pivot(egui::Align2::RIGHT_BOTTOM)
                     .fixed_pos(egui::pos2(
-                        map_rect.right() - 16.0,
+                        map_rect.right() - EDGE_MARGIN,
                         map_rect.center().y - 48.0 - 14.0 - 48.0 - 14.0,
                     ))
                     .show(ui.ctx(), |ui| {
@@ -1658,7 +1681,10 @@ impl eframe::App for ViewerApp {
                 let mut delta = 0.0;
                 egui::Area::new(egui::Id::new("zoom_buttons"))
                     .pivot(egui::Align2::RIGHT_CENTER)
-                    .fixed_pos(egui::pos2(map_rect.right() - 16.0, map_rect.center().y))
+                    .fixed_pos(egui::pos2(
+                        map_rect.right() - EDGE_MARGIN,
+                        map_rect.center().y,
+                    ))
                     .show(ui.ctx(), |ui| {
                         delta = zoom_control(ui);
                     });
@@ -1670,7 +1696,7 @@ impl eframe::App for ViewerApp {
                 if !self.layers.is_empty() {
                     let mut panel = PanelResult::default();
                     egui::Area::new(egui::Id::new("layers_panel"))
-                        .fixed_pos(map_rect.left_top() + egui::vec2(12.0, 12.0))
+                        .fixed_pos(map_rect.left_top() + egui::vec2(EDGE_MARGIN, 12.0))
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 panel = layers_panel(
@@ -2025,12 +2051,13 @@ fn run_app() {
             let saved = settings::load();
             let mut app = ViewerApp::new();
 
-            // Сначала слои, потом карта: open() записывает настройки целиком
+            // Слои остаются в списке, но после запуска все выключены (и не загружаются, пока
+            // их не включат). Карта открывается после слоёв: open() записывает настройки целиком.
             app.layers = saved
                 .layers
                 .iter()
                 .map(|e| {
-                    let mut layer = layers::Layer::new(PathBuf::from(&e.path), e.visible, e.color);
+                    let mut layer = layers::Layer::new(PathBuf::from(&e.path), false, e.color);
                     if let Some(icon) = e.icon.as_deref().and_then(icons::Icon::from_key) {
                         layer.icon = icon;
                     }
@@ -2047,7 +2074,6 @@ fn run_app() {
                 // Границы стран вшиты в программу: такой файл как отдельный слой не нужен
                 .filter(|l| !l.is_borders())
                 .collect();
-            app.filter = countries::Filter::from_codes(&saved.filter);
             for c in categories::ALL {
                 app.closed[c as usize] = saved.closed_categories.iter().any(|k| k == c.key());
             }

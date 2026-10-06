@@ -378,6 +378,7 @@ pub struct Filter {
 pub const UNKNOWN_CODE: &str = "?";
 
 impl Filter {
+    #[allow(dead_code)]
     pub fn from_codes(codes: &[String]) -> Filter {
         let mut checked: HashSet<String> = codes.iter().cloned().collect();
         // Старые настройки хранили «Россию» целиком
@@ -420,6 +421,7 @@ impl Filter {
         })
     }
 
+    #[allow(dead_code)]
     pub fn codes(&self) -> Vec<String> {
         let mut v: Vec<String> = self.checked.iter().cloned().collect();
         v.sort();

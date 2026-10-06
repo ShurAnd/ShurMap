@@ -46,6 +46,7 @@ impl Category {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_key(key: &str) -> Option<Category> {
         ALL.iter().copied().find(|c| c.key() == key)
     }

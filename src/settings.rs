@@ -1,4 +1,5 @@
-//! Настройки программы: последняя открытая карта и добавленные слои.
+//! Настройки программы: последняя открытая карта, список слоёв и свёрнутые разделы панели.
+//! Слои запоминаются, но при запуске все выключены; фильтр по странам не запоминается.
 //! Хранятся в %APPDATA%\ShurMap\settings.json
 
 use serde::{Deserialize, Serialize};
@@ -6,15 +7,10 @@ use std::path::PathBuf;
 
 use crate::APP_NAME;
 
-fn yes() -> bool {
-    true
-}
-
+/// Слой в списке. Включён ли он, не хранится: после запуска все слои выключены.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayerEntry {
     pub path: String,
-    #[serde(default = "yes")]
-    pub visible: bool,
     #[serde(default)]
     pub color: usize,
     /// Значок точек (ключ из icons.rs): запоминается, чтобы слой сразу рисовался правильно;
@@ -35,9 +31,6 @@ pub struct Settings {
     pub map: Option<String>,
     #[serde(default)]
     pub layers: Vec<LayerEntry>,
-    /// Коды отмеченных стран общего фильтра (пусто — фильтра нет)
-    #[serde(default)]
-    pub filter: Vec<String>,
     /// Свёрнутые разделы панели слоёв (ключи из categories.rs)
     #[serde(default)]
     pub closed_categories: Vec<String>,
@@ -57,7 +50,6 @@ impl Default for Settings {
         Settings {
             map: None,
             layers: Vec::new(),
-            filter: Vec::new(),
             closed_categories: Vec::new(),
         }
     }
@@ -81,7 +73,6 @@ pub fn load() -> Settings {
             return Settings {
                 map: Some(path.to_string()),
                 layers: Vec::new(),
-                filter: Vec::new(),
                 closed_categories: Vec::new(),
             };
         }

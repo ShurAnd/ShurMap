@@ -63,6 +63,7 @@ pub const ALL: [Icon; 27] = [
 ];
 
 impl Icon {
+    #[allow(dead_code)]
     pub fn key(self) -> &'static str {
         match self {
             Icon::Dot => "dot",
@@ -128,6 +129,7 @@ impl Icon {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_key(key: &str) -> Option<Icon> {
         ALL.iter().copied().find(|i| i.key() == key)
     }

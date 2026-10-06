@@ -291,6 +291,75 @@ fn filter_button(ui: &mut egui::Ui, active: usize) -> (bool, egui::Rect) {
     (response.clicked(), rect)
 }
 
+/// Кнопки в правом верхнем углу полноэкранного режима: слева «выйти из полного экрана»,
+/// справа «закрыть программу». Рамки окна в этом режиме нет, поэтому они нужны всегда.
+fn fullscreen_corner_buttons(ctx: &egui::Context, rect: egui::Rect) {
+    let mut leave = false;
+    egui::Area::new(egui::Id::new("fullscreen_button"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(egui::pos2(
+            rect.right() - 16.0 - 48.0 - 12.0,
+            rect.top() + 16.0,
+        ))
+        .show(ctx, |ui| {
+            leave = fullscreen_button(ui, true);
+        });
+    if leave {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+    }
+    let mut close = false;
+    egui::Area::new(egui::Id::new("close_button"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::RIGHT_TOP)
+        .fixed_pos(egui::pos2(rect.right() - 16.0, rect.top() + 16.0))
+        .show(ctx, |ui| {
+            close = close_button(ui);
+        });
+    if close {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
+/// Кнопка закрытия программы с крестиком (видна в полноэкранном режиме, где нет рамки окна).
+fn close_button(ui: &mut egui::Ui) -> bool {
+    let size = 48.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let response = response.on_hover_text("Закрыть программу");
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect.translate(egui::vec2(0.0, 3.0)).expand(2.0),
+        16.0,
+        egui::Color32::from_black_alpha(35),
+    );
+    painter.rect_filled(
+        rect,
+        14.0,
+        if response.hovered() {
+            egui::Color32::from_rgb(197, 34, 31)
+        } else {
+            egui::Color32::from_rgb(217, 48, 37)
+        },
+    );
+    let color = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(
+        if response.is_pointer_button_down_on() {
+            3.5
+        } else {
+            3.0
+        },
+        color,
+    );
+    let c = rect.center();
+    let d = 8.0;
+    painter.line_segment([c + egui::vec2(-d, -d), c + egui::vec2(d, d)], stroke);
+    painter.line_segment([c + egui::vec2(-d, d), c + egui::vec2(d, -d)], stroke);
+    response.clicked()
+}
+
 /// Кнопка полноэкранного режима: четыре уголка наружу (включить) или внутрь (выйти).
 fn fullscreen_button(ui: &mut egui::Ui, is_full: bool) -> bool {
     let size = 48.0;
@@ -836,6 +905,66 @@ fn keyboard(ctx: &egui::Context, osk: &mut Osk, text: &mut String) -> (egui::Rec
     (area.response.rect, edited)
 }
 
+/// Что ждёт подтверждения в окне «Да / Нет».
+#[derive(Clone, Copy, PartialEq)]
+enum Confirm {
+    /// Удалить один слой (по номеру в списке)
+    Layer(usize),
+    /// Удалить все слои
+    AllLayers,
+}
+
+/// Окно подтверждения по центру экрана с крупными кнопками «Да» и «Нет».
+/// Возвращает Some(true) при «Да», Some(false) при «Нет» или Esc, пока ответа нет — None.
+fn confirm_dialog(ctx: &egui::Context, question: &str, detail: &str) -> Option<bool> {
+    let screen = ctx.content_rect();
+    // Затемнение: заодно не пускает нажатия к карте и панелям под окном
+    egui::Area::new(egui::Id::new("confirm_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(90));
+        });
+
+    let mut answer = None;
+    egui::Area::new(egui::Id::new("confirm_dialog"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_min_width(300.0);
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(question).size(22.0).strong());
+                    if !detail.is_empty() {
+                        ui.label(detail);
+                    }
+                });
+                ui.add_space(14.0);
+                let (w, h, gap) = (130.0, 48.0, 16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - 2.0 * w - gap) / 2.0).max(0.0));
+                    ui.spacing_mut().item_spacing.x = gap;
+                    let yes = egui::Button::new(egui::RichText::new("Да").size(20.0));
+                    if ui.add_sized([w, h], yes).clicked() {
+                        answer = Some(true);
+                    }
+                    let no = egui::Button::new(egui::RichText::new("Нет").size(20.0));
+                    if ui.add_sized([w, h], no).clicked() {
+                        answer = Some(false);
+                    }
+                });
+                ui.add_space(8.0);
+            });
+        });
+    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(false);
+    }
+    answer
+}
+
 /// Что произошло в панели слоёв за кадр.
 #[derive(Default)]
 struct PanelResult {
@@ -892,6 +1021,8 @@ fn layers_panel(
     if *collapsed {
         return result;
     }
+    // Одна ширина у всей панели: так корзины всех строк встают в один столбец справа
+    ui.set_width(340.0);
     ui.horizontal(|ui| {
         let any_on = layers.iter().any(|l| l.visible);
         if ui
@@ -1009,10 +1140,12 @@ fn layers_panel(
                         ui.spinner();
                     }
 
-                    if trash_button(ui)
-                        .on_hover_text("Убрать слой из списка")
-                        .clicked()
-                    {
+                    // Корзина у правого края строки
+                    let gap = ui.available_width() - 22.0 - ui.spacing().item_spacing.x;
+                    if gap > 0.0 {
+                        ui.add_space(gap);
+                    }
+                    if trash_button(ui).on_hover_text("Удалить слой").clicked() {
                         result.remove = Some(i);
                     }
                 });
@@ -1066,6 +1199,8 @@ struct ViewerApp {
     /// Границы новой карты, по которым при первом показе подбирается масштаб
     pending_fit: Option<[f64; 4]>,
     fit_tries: u32,
+    /// Сколько кадров нарисовано (на старте окно разворачиваем на весь экран)
+    frames: u32,
     /// Где началось нажатие (чтобы отличить касание от перетаскивания)
     press_pos: Option<egui::Pos2>,
     /// Закреплённая подсказка: объект и место, где по нему нажали
@@ -1081,6 +1216,8 @@ struct ViewerApp {
     filter_search: String,
     /// Экранная клавиатура для строки поиска
     osk: Osk,
+    /// Открытое окно подтверждения удаления
+    confirm: Option<Confirm>,
     /// Рисовать точки значками (флаг в панели слоёв)
     /// Свёрнутые разделы панели слоёв (по номеру категории)
     closed: [bool; 6],
@@ -1100,6 +1237,7 @@ impl ViewerApp {
             max_zoom: 12.0,
             pending_fit: None,
             fit_tries: 0,
+            frames: 0,
             press_pos: None,
             pinned: None,
             layers: Vec::new(),
@@ -1109,6 +1247,7 @@ impl ViewerApp {
             filter_open: false,
             filter_search: String::new(),
             osk: Osk::default(),
+            confirm: None,
             closed: [false; 6],
             borders: layers::Layer::builtin_borders(include_bytes!(
                 "../assets/borders_rus.geojson"
@@ -1272,6 +1411,18 @@ impl eframe::App for ViewerApp {
                         self.save_settings();
                     }
                 }
+
+                if ui
+                    .add_enabled(
+                        !self.layers.is_empty(),
+                        egui::Button::new("Удалить все слои"),
+                    )
+                    .on_hover_text("Убрать все слои из списка")
+                    .on_disabled_hover_text("Слоёв нет")
+                    .clicked()
+                {
+                    self.confirm = Some(Confirm::AllLayers);
+                }
             });
 
             if let Some(file) = &self.file {
@@ -1321,6 +1472,17 @@ impl eframe::App for ViewerApp {
                 d.remove_temp::<egui::Pos2>(egui::Id::new(layers::TAP_ID));
             }
         });
+
+        // Запуск во весь экран: команду шлём уже после первых кадров, когда окно создано и
+        // имеет размер. Если включать полный экран при создании окна, справа остаётся полоса.
+        if self.frames < 3 {
+            self.frames += 1;
+            ui.ctx().request_repaint();
+            if self.frames == 3 {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
+        }
 
         // F11 — полноэкранный режим
         if ui.input(|i| i.key_pressed(egui::Key::F11)) {
@@ -1453,21 +1615,26 @@ impl eframe::App for ViewerApp {
                     }
                 }
 
-                // Кнопка полноэкранного режима над кнопками + / −
+                // Кнопка полноэкранного режима над кнопками + / −; в полном экране
+                // вместо неё в углу стоят кнопки выхода и закрытия
                 let is_full = ui.input(|i| i.viewport().fullscreen).unwrap_or(false);
-                let mut toggle_full = false;
-                egui::Area::new(egui::Id::new("fullscreen_button"))
-                    .pivot(egui::Align2::RIGHT_BOTTOM)
-                    .fixed_pos(egui::pos2(
-                        map_rect.right() - 16.0,
-                        map_rect.center().y - 48.0 - 14.0,
-                    ))
-                    .show(ui.ctx(), |ui| {
-                        toggle_full = fullscreen_button(ui, is_full);
-                    });
-                if toggle_full {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_full));
+                if is_full {
+                    fullscreen_corner_buttons(ui.ctx(), map_rect);
+                } else {
+                    let mut toggle_full = false;
+                    egui::Area::new(egui::Id::new("fullscreen_button"))
+                        .pivot(egui::Align2::RIGHT_BOTTOM)
+                        .fixed_pos(egui::pos2(
+                            map_rect.right() - 16.0,
+                            map_rect.center().y - 48.0 - 14.0,
+                        ))
+                        .show(ui.ctx(), |ui| {
+                            toggle_full = fullscreen_button(ui, false);
+                        });
+                    if toggle_full {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                    }
                 }
 
                 // Кнопка фильтра над кнопкой полноэкранного режима
@@ -1516,10 +1683,8 @@ impl eframe::App for ViewerApp {
                         });
 
                     if let Some(i) = panel.remove {
-                        self.pinned = None;
                         self.color_picker = None;
-                        self.layers.remove(i);
-                        self.save_settings();
+                        self.confirm = Some(Confirm::Layer(i));
                     } else if panel.changed {
                         self.pinned = None;
                         self.save_settings();
@@ -1624,6 +1789,46 @@ impl eframe::App for ViewerApp {
                 ui.centered_and_justified(|ui| {
                     ui.label("Нажмите «Выбрать карту…» и выберите файл .pmtiles");
                 });
+                // Без карты кнопок поверх неё нет, но в полном экране без них не выйти и не закрыть
+                if ui.input(|i| i.viewport().fullscreen).unwrap_or(false) {
+                    fullscreen_corner_buttons(ui.ctx(), map_rect);
+                }
+            }
+        }
+
+        // Окно «Удалить слой? Да / Нет»
+        if let Some(confirm) = self.confirm {
+            let (question, detail) = match confirm {
+                Confirm::Layer(i) => match self.layers.get(i) {
+                    Some(l) => (
+                        "Удалить слой?",
+                        layers::short_name(&l.name(), 40).to_string(),
+                    ),
+                    None => {
+                        self.confirm = None;
+                        return;
+                    }
+                },
+                Confirm::AllLayers => (
+                    "Удалить все слои?",
+                    format!("Слоёв в списке: {}", self.layers.len()),
+                ),
+            };
+            match confirm_dialog(ui.ctx(), question, &detail) {
+                Some(true) => {
+                    match confirm {
+                        Confirm::Layer(i) => {
+                            self.layers.remove(i);
+                        }
+                        Confirm::AllLayers => self.layers.clear(),
+                    }
+                    self.confirm = None;
+                    self.pinned = None;
+                    self.color_picker = None;
+                    self.save_settings();
+                }
+                Some(false) => self.confirm = None,
+                None => {}
             }
         }
     }
